@@ -1,0 +1,39 @@
+[Unit]
+Description=Cluster Console node daemon (Docker + Minecraft server control)
+Documentation=https://github.com/your-org/cluster-console
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+# The daemon mounts the Docker socket and owns every game-server volume, so it
+# runs as root. Alternatively use `User=cluster` plus `SupplementaryGroups=docker`
+# and ensure /srv/minecraft is owned by that user.
+User=root
+Group=docker
+WorkingDirectory=/opt/cluster-console
+EnvironmentFile=/etc/cluster-console/daemon.env
+ExecStart=/opt/cluster-console/bin/cluster-daemon
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+
+# Logs go to the journal: journalctl -u cluster-daemon -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cluster-daemon
+
+# Hardening that still permits Docker and game-server volume access.
+# ProtectHome is intentionally off: local-path imports may point at a server
+# directory under /home.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

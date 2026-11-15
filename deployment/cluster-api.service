@@ -1,0 +1,39 @@
+[Unit]
+Description=Cluster Console control-plane API
+Documentation=https://github.com/your-org/cluster-console
+After=network-online.target cluster-daemon.service
+Wants=network-online.target
+# The API can start without the daemon (it will report daemon errors), but
+# starting after it makes the first request after boot reliable.
+Wants=cluster-daemon.service
+
+[Service]
+Type=simple
+User=cluster
+Group=cluster
+WorkingDirectory=/var/lib/cluster-console
+EnvironmentFile=/etc/cluster-console/api.env
+ExecStart=/opt/cluster-console/bin/cluster-api
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+# journalctl -u cluster-api -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cluster-api
+
+# The API only needs its SQLite directory; it never touches Docker.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/cluster-console
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

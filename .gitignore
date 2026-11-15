@@ -1,0 +1,41 @@
+# Root .gitignore — Cluster Console
+
+# --- Rust ---
+target/
+backend/target/
+*.rs.bk
+*.pdb
+
+# --- Node / Vite ---
+node_modules/
+frontend/dist/
+frontend/node_modules/
+.vite/
+*.tsbuildinfo
+
+# --- Runtime data (never commit) ---
+data/
+deployments/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# --- Logs ---
+*.log
+logs/
