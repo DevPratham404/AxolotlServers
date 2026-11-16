@@ -165,6 +165,65 @@ export interface UpdateResourcesRequest {
   cpu_limit?: number
 }
 
+/** A ZIP snapshot stored on the daemon host. */
+export interface BackupInfo {
+  id: string
+  name: string
+  size_bytes: number
+  sha256: string
+  created_at_ms: number
+  server_was_running: boolean
+}
+
+/** Result of re-hashing a stored archive against its manifest. */
+export interface BackupVerification {
+  id: string
+  verified: boolean
+  expected_sha256: string
+  actual_sha256: string
+}
+
+/** Retention policy for a single server; `0` keeps every backup. */
+export interface BackupSettings {
+  server_id: string
+  retention_count: number
+}
+
+export type ScheduleTaskType = 'backup' | 'start' | 'stop' | 'restart' | 'command'
+
+/** Recurring automation owned by the control plane. */
+export interface ScheduleView {
+  id: string
+  server_id: string
+  name: string
+  task_type: ScheduleTaskType
+  command: string | null
+  interval_minutes: number
+  enabled: boolean
+  next_run_at: string
+  last_run_at: string | null
+  last_status: 'success' | 'error' | null
+  last_error: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface CreateScheduleRequest {
+  name: string
+  task_type: ScheduleTaskType
+  command?: string
+  interval_minutes: number
+  enabled?: boolean
+  run_now?: boolean
+}
+
+export interface UpdateScheduleRequest {
+  name?: string
+  command?: string
+  interval_minutes?: number
+  enabled?: boolean
+}
+
 /** One logical line of `server.properties`, mirrored from the API parser. */
 export type PropertyEntry =
   | { kind: 'comment'; text: string }

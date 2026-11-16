@@ -15,6 +15,8 @@ pub fn router() -> Router<AppState> {
         .merge(super::properties::router())
         .merge(super::files::router())
         .merge(super::addons::router())
+        .merge(super::automation::router())
+        .merge(super::runtimes::router())
 }
 
 /// Returns the principal behind the presented token.

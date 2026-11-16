@@ -1,10 +1,11 @@
 # Architecture — Cluster Console
 
-> Status: **M8.8 delivered; manual review pending.** Backend is Rust; the glass frontend, auth flow,
-> server lifecycle, telemetry WebSocket, graphical console, player tools, file manager, Modrinth
-> App Store, and ZIP/local-path server importer are implemented. Oracle VPS Nginx and systemd files
-> are in `deployment/`. Decisions D1–D4 and D9–D13 are accepted; open items are listed in §13.
-> Complete the M8.8 manual review before proceeding to M9.
+> Status: **M8.8 + automation delivered; manual review pending.** Backend is Rust; the glass
+> frontend, auth flow, server lifecycle, telemetry WebSocket, graphical console, player tools, file
+> manager, Modrinth App Store, ZIP/local-path server importer, ZIP backups, recurring tasks and the
+> MCP server are implemented. Oracle VPS Nginx and systemd files are in `deployment/`. Decisions
+> D1–D4, D9–D14 are accepted; open items are listed in §13. Complete the manual review before
+> proceeding to M10 (multi-node).
 
 ## 1. Goal & scope
 
@@ -17,18 +18,22 @@ players, back up and restore — without the user ever opening a shell.
 - Per-server hard RAM/CPU limits enforced by Docker.
 - Visual `server.properties` + whitelist/ops/bans editors.
 - Live player roster with stat/inventory/permission editing (assisted by a companion plugin).
-- Backup timeline (create, inspect, restore, delete).
-- **Optional BungeeCord / Velocity proxies**: a proxy is a first-class managed container
-  (`server_type = velocity | bungeecord`) that routes players to backend game servers grouped in a
-  proxy network.
+- Backup center (create, verify, download, restore, delete, keep-last-N retention).
+- **Optional BungeeCord / Velocity / Waterfall proxies**: a proxy is a first-class managed container
+  (`server_type = velocity | bungeecord | waterfall`) that routes players to backend game servers
+  grouped in a proxy network.
 - Local accounts with JWT sessions.
+- Recurring backups/power/RCON tasks executed by an in-process scheduler.
+- Modrinth App Store for mods, plugins, datapacks, resource packs and modpacks.
+- An MCP server exposing markdown documentation and the REST API to AI clients.
 
 **Out of scope (v1, revisit later)**
 
-- Modpack browser / CurseForge integration, plugin marketplace.
+- CurseForge integration and a paid plugin marketplace.
 - Multi-tenant billing, teams, SSO/OIDC.
-- Automatic horizontal scaling and scheduling.
-- Bedrock support.
+- Automatic horizontal scaling; recurring tasks are single-node only.
+- Authoritative live vitals/inventory (companion plugin).
+- Backup upload, locked snapshots, off-host sync and notifications.
 - Multi-node operation — **schema is ready for it**, the UI/flow is not built yet.
 
 ## 2. Design principles
@@ -113,9 +118,11 @@ src/
   features/
     auth/                     LoginPage, ChangePasswordPage
     dashboard/                DashboardPage (stats, recent servers, posture)
-    servers/                  ServersPage, ServerCard, CreateServerWizard, useServers
+    servers/                  ServersPage, ServerCard, CreateServerWizard,
+                              ImportServerWizard, useServers
     server-detail/            ServerDetailPage, StatsPanel, LogConsole, ConfigurationPanel,
-                              players/*, telemetry hook
+                              AppStorePanel, AutomationPanel, FileManagerPanel, players/*,
+                              telemetry hook
     settings/                 SettingsPage
   lib/                        api + WS URL, JWT decode, wire types, server metadata, log parser,
                               properties schema
@@ -133,10 +140,31 @@ capped exponential backoff, keeps a 600-line ring buffer, and never stores telem
 state. `lib/logs.ts` parses Minecraft/Paper/proxy lines into time, source, level and a visual tone
 (`info`, `warn`, `error`, `join`, `leave`, `chat`, `debug`, `system`) for the graphical console.
 
-Player UX (M5-Part 1): the detail page has `Console`, `Players` and `Configuration` tabs. The roster
-uses preview data, Crafatar avatars with an initials fallback, ping bars and hover actions wired to
-the real RCON routes. The slide-out inspection drawer renders disabled Vitals sliders and a 9×4
-inventory grid behind a "Requires Companion Plugin" lock; no player state is read from the server yet.
+Player UX (M5-Part 1): the detail page has `Console`, `Players`, `Configuration`, `File Manager`,
+`App Store` and `Automation` tabs. The roster uses preview data, Crafatar avatars with an initials
+fallback, ping bars and hover actions wired to the real RCON routes. The slide-out inspection drawer
+renders disabled Vitals sliders and a 9×4 inventory grid behind a "Requires Companion Plugin" lock;
+no player state is read from the server yet.
+
+App Store UX (M8): `AppStorePanel` maps Modrinth project types to runtime folders. Capability
+helpers cover all 19 runtimes: mods/modpacks for Fabric/Forge/NeoForge/Quilt and hybrid servers,
+plugins for Bukkit-family runtimes, Sponge and proxies, datapacks/resource packs everywhere.
+Loader filters are derived from the same helpers so the search UI cannot offer an incompatible
+project type. The details modal renders Modrinth bodies with `react-markdown` + `remark-gfm`, then
+runs `rehype-raw` + `rehype-sanitize` so project-authored HTML (`<center>`, images, `<br>`,
+details/summary) renders instead of leaking as text. Iframes are mounted only for an allow-list of
+HTTPS YouTube/Vimeo hosts and receive a sandbox; non-HTTPS `src` values are stripped.
+
+Automation UX: `AutomationPanel` lists ZIP backups and scheduled tasks, creates backups with an
+optional label, verifies them against their SHA-256 manifest, downloads archives, configures
+keep-last-N retention, restores with an explicit confirmation, and creates/pauses/runs/deletes
+backup, power and RCON-command schedules. Destructive actions refresh the parent page so power
+state changes are reflected immediately.
+
+Create wizard (M3/M8.8): runtime categories and the selected card stay in sync; world fields are
+validated client- and server-side. An optional data ZIP is uploaded **after** the container is
+created (stopped) through `POST /api/v1/servers/{id}/import-data`; if the import fails the wizard
+keeps the created server and offers "Open server" instead of silently dropping the archive.
 
 Configuration UX (M6): `lib/properties.ts` holds a curated schema (sections, labels, enum options,
 number ranges, sliders) mapping properties to glassmorphic toggles, selects, range/number inputs and
@@ -159,7 +187,11 @@ Cargo dependencies (workspace-pinned): `axum 0.8` (ws), `tokio`, `tower`/`tower-
 | --------------------- | ------ | ------------------------------------------------------------------ |
 | `routes/`             | ✅ M2  | `/healthz`, `/readyz`, `/api/auth/*`, `/api/v1/*`                   |
 | `routes/auth.rs`      | ✅ M2  | `POST /api/auth/login`, `POST /api/auth/change-password`            |
-| `routes/servers.rs`   | ✅ M4  | `GET/POST /api/v1/servers`, `GET/DELETE /{id}`, start, stop; validation |
+| `routes/servers.rs`   | ✅ M4  | server CRUD, start/stop/restart, create validation, `import-data` |
+| `routes/addons.rs`    | ✅ M8  | Modrinth install routing for every runtime capability             |
+| `routes/files.rs`     | ✅ M7  | file manager browsing, upload/download, rename/copy/delete        |
+| `routes/automation.rs`| ✅ new | backup CRUD/restore/download/verify/retention + schedule CRUD/run |
+| `scheduler.rs`        | ✅ new | 20 s worker for recurring tasks and backup cataloging            |
 | `routes/players.rs`   | ✅ M5  | raw `/command` + semantic `players/{username}/kick|ban|op`             |
 | `routes/properties.rs`| ✅ M6  | `GET/PUT /api/v1/servers/{id}/properties`, redaction + hash checks    |
 | `properties.rs`       | ✅ M6  | Java properties parse/serialise, escape handling, redaction helpers   |
@@ -175,12 +207,14 @@ Cargo dependencies (workspace-pinned): `axum 0.8` (ws), `tokio`, `tower`/`tower-
 | `store/`              | later  | extracted non-auth queries, transactional port allocation           |
 | `jobs/`               | later  | durable job rows, progress fan-out, cancellation                    |
 | `ws/`                 | later  | multi-topic hub, snapshots + sequence gaps (per-server socket ✅ M4) |
-| `nodes/`              | M9     | node registry, heartbeats, multi-node dispatch                      |
+| `nodes/`              | M10    | node registry, heartbeats, multi-node dispatch                      |
 | `rbac/`               | M7     | roles/permissions layered over the existing auth extractor          |
 
 Async model: every request is a tokio task; shared state is `Arc<AppState>`; background workers
 (heartbeat timeout, job scheduler, metrics aggregation) are spawned with `tokio::spawn` and
-stopped via `CancellationToken` on shutdown.
+stopped via `CancellationToken` on shutdown. The automation worker (`scheduler.rs`) starts with
+the API, sleeps 5 s, then claims due rows every 20 s by advancing `next_run_at` before executing
+them.
 
 ### 4.3 Node daemon — `backend/crates/daemon` (`cluster-daemon`)
 
@@ -189,7 +223,8 @@ logs/metrics, read/write files inside the server volume, run backups, expose a l
 channel to the control plane.
 
 Cargo dependencies: `bollard 0.21` (Docker Engine client), `axum` (control channel), `tokio`,
-`futures-util`, `tokio-stream`, `serde`, `tracing`, `thiserror`, `uuid`, `time`, `sha2`, `hex`.
+`futures-util`, `tokio-stream`, `serde`, `tracing`, `thiserror`, `uuid`, `time`, `sha2`, `hex`,
+`zip` (deflate).
 
 | Module (implemented)  | Responsibility                                                    |
 | --------------------- | ----------------------------------------------------------------- |
@@ -197,17 +232,43 @@ Cargo dependencies: `bollard 0.21` (Docker Engine client), `axum` (control chann
 | `docker.rs`           | bollard connect/ping, network ensure, container create/start/stop/remove |
 | `minecraft.rs`        | pure spec → env + `HostConfig`; RCON port/password derivation     |
 | `rcon.rs`             | Source RCON framing, auth/exec client, credential resolution      |
-| `files.rs`            | sandboxed path validation, atomic text read/write, SHA-256 hashes  |
+| `files.rs`            | sandboxed path validation, atomic text read/write, SHA-256 hashes |
 | `stats.rs`            | Docker stats → `StatsSample`; CPU delta, working set, network sums |
 | `logs.rs`             | multiplexed log frames → timestamped `LogLine`s, ANSI stripping   |
+| `imports.rs`          | ZIP/host-path import, staging, traversal-safe extraction          |
+| `modpacks.rs`         | `.mrpack` download + verified override extraction                 |
+| `backups.rs`          | ZIP snapshots, SHA-256 manifests, verified restore, deletion      |
+| `players.rs`          | access-list reads/writes (`ops`, `whitelist`, `banned-*`)         |
+| `telemetry.rs`        | NDJSON framing helpers for stats/log streams                      |
 | `api/auth.rs`         | HMAC verification middleware (timestamp window + constant-time)   |
-| `api/routes.rs`       | `/daemon/servers/*` lifecycle, `/command`, HMAC NDJSON streams, file GET/PUT |
-| `error.rs`            | `DaemonError` → `ApiErrorBody`, Docker status mapping              |
+| `api/routes.rs`       | `/daemon/servers/*` lifecycle, command, streams, files, add-ons, imports, backups |
+| `error.rs`            | `DaemonError` → `ApiErrorBody`, Docker status mapping             |
 
-Planned for later milestones: `players/` (NBT), `backup.rs`, and a persistent `agent.rs` heartbeat
-channel.
+Planned for later milestones: a persistent `agent.rs` heartbeat channel and multi-node
+reconciliation.
 
 ### 4.4 Docker integration — see §6.
+
+### 4.5 MCP server — `mcp/`
+
+A standalone Node 20+ process that speaks the Model Context Protocol over stdio. It is the
+repository's **markdown context protocol** integration: every markdown file (README, `docs/*`,
+`deployment/README.md`, `mcp/README.md`) is registered as a `cluster://docs/<path>` resource with
+`text/markdown`, re-read on each request. Tools wrap the REST API with a JWT-authenticated client
+(`CLUSTER_API_TOKEN`, or lazy login from `CLUSTER_API_USERNAME`/`CLUSTER_API_PASSWORD` with one
+transparent re-login after a 401):
+
+| Area | Tools |
+| ---- | ----- |
+| Docs | `list_documents`, `read_document` |
+| Servers | `list_servers`, `get_server`, `create_server`, `server_power` |
+| Backups | `list_backups`, `create_backup`, `restore_backup`, `delete_backup`, `verify_backup`, `get_backup_retention`, `set_backup_retention` |
+| Schedules | `list_schedules`, `create_schedule`, `update_schedule`, `run_schedule`, `delete_schedule` |
+| Catalog | `describe_runtime` (plugins/mods/modpacks + Modrinth loaders) |
+
+Destructive tools carry MCP annotations and `restore_backup` creates a safety backup by default.
+The MCP server has no port and no storage of its own; it has exactly the authority of its token,
+so it is not exposed by the deployment Nginx config.
 
 ## 5. Data ownership
 
@@ -218,7 +279,8 @@ channel.
 | Port assignments                 | control-plane SQLite (unique index) |
 | Live container state, logs       | node daemon → Docker               |
 | World, configs, player data      | server volume on the node          |
-| Backup archives                  | node disk (+ future S3)            |
+| Backup archives                  | node disk (`<MC_DATA_ROOT>/<id>/backups/*.zip`) |
+| Backup metadata + schedules      | control-plane SQLite (`backups`, `scheduled_tasks`) |
 | Player display cache             | control-plane (derived, rebuildable) |
 
 The control plane stores **desired state**; the daemon reports **observed state**. Status shown in
@@ -232,7 +294,9 @@ bug of a dashboard claiming "running" for a crashed container.
 Use `itzg/minecraft-server` rather than a bespoke image. It handles
 Vanilla/Paper/Fabric installation, Java version selection, EULA, RCON and graceful shutdown,
 saving weeks of work. The image ref is configurable via `MC_IMAGE` (default
-`itzg/minecraft-server:latest`); production deployments should pin it by digest.
+`itzg/minecraft-server:latest`); production deployments should pin it by digest. Bedrock uses
+`MC_BEDROCK_IMAGE` and Velocity/BungeeCord/Waterfall use `MC_PROXY_IMAGE`
+(default `itzg/mc-proxy:latest`), because those families are separate images in the itzg ecosystem.
 
 We wrap it, not depend on it blindly:
 
@@ -241,18 +305,24 @@ We wrap it, not depend on it blindly:
   image later touches one module.
 - M2 sets only `EULA`, `TYPE`, `MEMORY`, `SERVER_NAME`, `OVERRIDE_SERVER_PROPERTIES=false`, plus
   `ONLINE_MODE=false` for proxy backends. M5 adds `ENABLE_RCON=TRUE`, `RCON_PORT=25575` and a
-  per-server `RCON_PASSWORD`. A wider allow-list (`VERSION`, `MAX_PLAYERS`, `OPS`) is still future
-  work; the config editor edits files rather than environment.
+  per-server `RCON_PASSWORD`; later milestones add `VERSION`, world fields, `ARCLIGHT_TYPE` plus a
+  daemon-resolved `ARCLIGHT_RELEASE` tag for Arclight, and daemon-resolved `CUSTOM_SERVER`/
+  `MAGMA_VERSION` for CatServer and Magma.
 - `OVERRIDE_SERVER_PROPERTIES=false` — we edit the file through the config editor instead, so the
   image never fights our writes.
-- Version pinning per server is explicit; no `LATEST` resolution at start time (reproducibility).
+- Version pinning per server is explicit. Normal Java runtimes accept `LATEST`; Arclight,
+  CatServer, Mohist and Magma do **not** publish builds for every Mojang release and therefore
+  require a concrete supported version. `GET /api/v1/runtimes/{type}/versions` resolves the
+  runtime's own release index (GitHub, Mohist API, Magma API or the Mojang manifest) and the API
+  rejects `LATEST`/`SNAPSHOT` for those four runtimes.
 
 ### 6.2 Container contract
 
 - Name: `mc-<serverId>`; labels `console.managed=true`, `console.server=<id>`,
   `console.type=<kind>` — listing/cleanup is label-driven, never name parsing.
 - Volume: `<MC_DATA_ROOT>/<serverId>/data:/data` (bind mount, not a named volume, so backups and
-  file edits are plain host paths and survive Docker resets). `MC_DATA_ROOT` is canonicalised at
+  file edits are plain host paths and survive Docker resets); proxies mount the same host directory
+  at `/server`, the mc-proxy image's home. `MC_DATA_ROOT` is canonicalised at
   daemon startup because Docker requires an absolute bind source.
 - Restart policy: `unless-stopped`, so daemon restarts don't kill worlds.
 - Security: `no-new-privileges`, `PidsLimit=512`, stop grace period 35 s. Healthchecks and an
@@ -271,14 +341,16 @@ We wrap it, not depend on it blindly:
 Enforcement is Docker's, implemented in `host_config`: `Memory == MemorySwap == ram_mb` (no swap),
 `NanoCPUs = cpu_limit × 1e9`, `PidsLimit = 512`, `no-new-privileges`. The API validates
 `ram_mb ∈ [512, 65536]` and `cpu_limit ∈ (0, 32]` before dispatch; the daemon re-validates rather
-than trusting the control plane. Node-capacity admission control arrives with multi-node (M9).
+than trusting the control plane. Node-capacity admission control arrives with multi-node (M10).
 
 ### 6.4 Networking
 
 - Dedicated user-defined bridge `MC_NETWORK` (default `mc-net`), created idempotently by the daemon.
   No `--network host`.
 - Standalone server: `PortBindings` maps `0.0.0.0:<game_port>` → `25565/tcp`, and the container
-  exposes `25565/tcp` on the bridge network.
+  exposes `25565/tcp` on the bridge network. Proxies publish the same host port to
+  `25577/tcp` (mc-proxy's BungeeCord/Waterfall listener); Velocity publishes `25565/tcp`
+  because that is its own default; Bedrock publishes UDP `19132`.
 - RCON is published **only on the loopback**: `127.0.0.1:<derived 30000–39999>` → `25575/tcp` for
   every server. The daemon connects to `127.0.0.1`, which works on Linux VPS hosts and Docker
   Desktop (where container IPs are not routable from the host) while remaining unreachable
@@ -290,17 +362,18 @@ than trusting the control plane. Node-capacity admission control arrives with mu
 ### 6.5 Proxy networks — Velocity / BungeeCord (optional)
 
 A proxy is **not** a special daemon feature: it is a managed container like any other, with
-`server_type = velocity | bungeecord`, wrapped by the same translation (the itzg image supports
-`TYPE=VELOCITY` and `TYPE=BUNGEECORD`).
+`server_type = velocity | bungeecord | waterfall`, running on the dedicated `itzg/mc-proxy` image
+(`MC_PROXY_IMAGE`) which supports `TYPE=VELOCITY`, `TYPE=BUNGEECORD` and `TYPE=WATERFALL`.
 
 Grouping and routing:
 
 - `proxy_networks` groups one proxy with its backend servers. Proxy containers also carry a
   `proxy_network_id`, so the group is discoverable from either side.
-- **Port exposure rule implemented in M2:** when `is_behind_proxy = 0`, the container gets
-  `PortBindings { "25565/tcp": 0.0.0.0:<game_port> }`. When `is_behind_proxy = 1`, `PortBindings`
-  is omitted entirely: the container still lists `25565/tcp` in `ExposedPorts`, so it is reachable
-  by other containers on `mc-net`, but **nothing is bound on the host**. Verified by inspecting the
+- **Port exposure rule:** when `is_behind_proxy = 0`, the container gets
+  `PortBindings { "<game container port>/tcp": 0.0.0.0:<game_port> }`. When `is_behind_proxy = 1`,
+  `PortBindings` is omitted entirely: the container still lists its game port (25565 for Java
+  servers and Velocity, 25577 for BungeeCord/Waterfall) in `ExposedPorts`, so it is reachable by
+  other containers on `mc-net`, but **nothing is bound on the host**. Verified by inspecting the
   created container: proxied backend → `PortBindings = {}`; standalone → `0.0.0.0:<port>`.
 - Backends in a proxy network run `online-mode=false` (Velocity/BungeeCord performs auth) and must
   use player-info forwarding:
@@ -355,15 +428,17 @@ user-supplied path on the browser API.
 ## 7. Key data flows
 
 **Create server (M2, synchronous)**
-`POST /api/v1/servers` → validate name/type/port/limits + proxy rules → insert `servers` row with
-`status = provisioning` (unique name/port indexes prevent races) → sign and send
-`POST /daemon/servers/{id}/create` → daemon ensures `mc-net`, creates the volume, creates the
-container → on success the control plane sets `status = stopped`; on daemon failure the row is
-deleted (compensation) and the error is returned. `POST /{id}/start|stop` forwards to the daemon and
-then updates `status`. A durable `jobs` table and async progress events remain future work; current
-calls are synchronous and therefore bounded by the daemon client's 30 s timeout. The M3 wizard
-mirrors this contract in three steps (runtime → resources → name/port/review) and reloads the list
-after the `201`.
+`POST /api/v1/servers` → validate name/type/port/limits + proxy rules + world fields
+(`world_name` is a single safe path component; seed length; world type/difficulty/gamemode are
+enumerated) → insert `servers` row with `status = provisioning` (unique name/port indexes prevent
+races) → sign and send `POST /daemon/servers/{id}/create` → daemon ensures `mc-net`, creates the
+volume, creates the container → on success the control plane sets `status = stopped`; on daemon
+failure the row is deleted (compensation) and the error is returned. `POST /{id}/start|stop`
+forwards to the daemon and then updates `status`. A durable `jobs` table and async progress events
+remain future work; current calls are synchronous and therefore bounded by the daemon client's
+30 s timeout. The wizard mirrors this contract (runtime → world → resources → details); an optional
+data ZIP is then sent to `POST /api/v1/servers/{id}/import-data`, which requires `stopped | error`
+and streams a temporary file to the daemon's import endpoint.
 
 **Create proxy network**
 `POST /api/v1/proxy-networks {name, kind}` → insert network → create the proxy container
@@ -372,10 +447,12 @@ backend configs → backends are marked `is_behind_proxy = 1`, their published p
 they restart in offline mode. Route tables in the proxy UI map hostnames → backend `game_port`.
 (M2 only validates that a referenced `proxy_network_id` exists; there is no CRUD endpoint yet.)
 
-**Power action**
-`POST /api/v1/servers/{id}/actions {action: "restart", requestId}` → control plane checks observed
-state and permission → daemon executes (RCON `stop` → wait → start, with timeout) → status events.
-Actions return 202 + job ID; the UI shows a transient state, never a fake success.
+**Power action (implemented)**
+`POST /api/v1/servers/{id}/start|stop|restart` → control plane loads the row, forwards the current
+`ram_mb`/`cpu_limit` (start/restart) to the daemon → daemon applies limits and drives Docker →
+status is updated on success. Calls are synchronous and bounded by the daemon client's 30 s timeout;
+there is no durable job row or 202/job-ID protocol yet. The UI disables conflicting actions while a
+request is in flight and never shows a fake success.
 
 **RCON command (M5)**
 `POST /api/v1/servers/{id}/command {command}` → validate (≤1024 chars, no control characters,
@@ -405,10 +482,33 @@ signs `PUT /daemon/servers/{id}/files/server.properties`. The daemon rejects a s
 writes atomically (temp file, same dir, `fsync`, `rename`), and returns the new hash; the UI shows a
 restart-required modal. Comments, blank lines, ordering and unknown keys survive the round-trip.
 
-**Backup**
-Job: RCON `save-off` → `save-all flush` → tar+zstd the world (and selected configs) with a manifest
-(server, version, timestamp, SHA-256) → `save-on` → catalog row → timeline entry.
-Restore = safety backup → stop → verify hash → extract to staging → swap directories → start.
+**Backup (implemented)**
+`POST /api/v1/servers/{id}/backups` → daemon checks container state → if running: RCON `save-off`
+then `save-all flush` (best-effort) → ZIP the whole `<data>/` volume to
+`<MC_DATA_ROOT>/<id>/backups/<uuid>.zip` with deflate in a blocking worker, skipping symlinks and
+enforcing entry/size caps → hash the archive (SHA-256) → write `<uuid>.json` manifest → RCON
+`save-on` → control plane catalogs the row. Listing reads the daemon manifests and reconciles the
+catalog. Restore = verify manifest hash → extract to a staging directory with traversal checks →
+rename the live `data/` aside → rename staging into place → restart the container if it was running;
+the daemon attempts the restart even if the restore fails. Delete removes the archive and manifest.
+Scheduled backups use the same daemon endpoint through the worker.
+
+`GET /backups/{id}/download` streams the archive from the daemon in 64 KiB chunks through the
+signed GET channel; neither process buffers the ZIP in memory. `POST /backups/{id}/verify`
+re-hashes the archive and compares it with the manifest without touching the running server.
+Retention lives in `backup_settings` (migration `0006`): a per-server `retention_count` of
+`0` disables pruning, otherwise the control plane keeps the newest N archives and deletes the
+rest after each successful manual or scheduled backup. Pruning is best effort and cannot fail
+the snapshot that triggered it.
+
+**Scheduled task (implemented)**
+Rows in `scheduled_tasks` hold `interval_minutes`, `enabled`, `next_run_at`, `last_run_at`,
+`last_status` and `last_error`. A single API worker polls every 20 s, selects up to 20 due rows,
+advances `next_run_at` **before** spawning execution (so a slow task is not claimed twice), then
+runs `backup | start | stop | restart | command` through the same daemon client as HTTP requests.
+Backups are cataloged; failures are recorded on the row and logged. A crash during execution means
+the task retries on its next interval; there is no durable job queue yet. "Run now" executes the
+same function synchronously and returns the refreshed row.
 
 ## 8. Real-time protocol
 
@@ -429,6 +529,16 @@ Both use the existing canonical HMAC signature with an empty body and are served
 timestamps=true, tail=200)` drives the log stream. Multi-line Docker log frames are split and the
 RFC 3339 prefix is removed before encoding. Bounded `mpsc` channels apply backpressure, and closing
 the HTTP response stops the Docker polling task.
+
+The API's daemon client intentionally has **no total request timeout** on these streams. Its
+per-request 30 s timeout applies to ordinary control calls only; applying it to a long-lived NDJSON
+response made reqwest abort every stats/log stream after 30 s with
+`error decoding response body`. The client keeps a 10 s connect timeout instead.
+
+Missing optional paths are not treated as failures: listing an absent `plugins`, `mods`,
+`resourcepacks` or `<world>/datapacks` directory returns an empty list, and daemon `404` responses
+are logged at debug level. RCON `Connection refused` immediately after a start is translated to a
+retryable `409 Conflict` ("server is still starting") instead of a `503` error-level log.
 
 `StatsSample` contains `cpu_percent` (normalised so `online_cpus * 100` is full machine load),
 `memory_used_bytes` (working set: usage minus reclaimable page cache), `memory_limit_bytes`,
@@ -550,6 +660,48 @@ protected route except `GET /api/v1/me` with `403 password_change_required` unti
 `POST /api/auth/change-password` succeeds; that route uses a variant middleware that validates the
 token but ignores the flag. A successful rotation clears the column and returns a fresh token.
 
+Migration `0003_forge_and_game_version.sql` rebuilds `servers` to add `forge` and
+`game_version TEXT NOT NULL DEFAULT 'LATEST'` (SQLite cannot widen a CHECK constraint in place).
+
+Migration `0004_server_catalog.sql` expands the runtime CHECK to **19** types (`vanilla`, `paper`,
+`fabric`, `forge`, `velocity`, `bungeecord`, `bedrock`, `neoforge`, `quilt`, `spigot`, `purpur`,
+`pufferfish`, `folia`, `sponge`, `mohist`, `arclight`, `catserver`, `magma`, `waterfall`) and adds
+`world_name`, `world_seed`, `world_type`, `difficulty`, `gamemode` with defaults.
+
+Migration `0005_backups_and_schedules.sql` adds:
+
+```sql
+backups (
+  id TEXT PRIMARY KEY, server_id TEXT REFERENCES servers(id) ON DELETE CASCADE,
+  name TEXT, size_bytes INTEGER, sha256 TEXT, server_was_running INTEGER,
+  created_at_ms INTEGER, created_at TEXT
+)
+
+scheduled_tasks (
+  id TEXT PRIMARY KEY, server_id TEXT REFERENCES servers(id) ON DELETE CASCADE,
+  name TEXT, task_type TEXT CHECK (task_type IN
+    ('backup','start','stop','restart','command')),
+  command TEXT, interval_minutes INTEGER CHECK (1..525600),
+  enabled INTEGER, next_run_at TEXT, last_run_at TEXT,
+  last_status TEXT CHECK (last_status IN ('success','error')), last_error TEXT,
+  created_at TEXT, updated_at TEXT
+)
+```
+
+Migration `0006_backup_settings.sql` adds the per-server retention policy:
+
+```sql
+backup_settings (
+  server_id TEXT PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+  retention_count INTEGER NOT NULL DEFAULT 0 CHECK (retention_count BETWEEN 0 AND 500),
+  updated_at TEXT
+)
+```
+
+Indexes cover backup timelines (`server_id, created_at_ms DESC`), due tasks
+(`enabled, next_run_at`) and per-server schedules. The archive bytes stay on the node; the row is a
+catalog for fast UI listing and survives daemon reconciliation.
+
 Indexes: `servers(proxy_network_id)`, `servers(status)`. A trigger advances `updated_at` on every
 update. Foreign keys are enabled on each connection.
 
@@ -561,9 +713,10 @@ Notes:
   a proxy.
 - `proxy_network_id` is optional and `ON DELETE SET NULL`, so removing a network never deletes
   servers.
-- **Deferred:** `nodes`, `sessions`, `server_revisions`, `players`, `backups`, `jobs`, `audit_log`
-  arrive with their milestones. The single-node v1 does not need `servers.node_id` yet; adding it
-  later is an additive migration (`ALTER TABLE servers ADD COLUMN node_id` + backfill).
+- **Deferred:** `nodes`, `sessions`, `server_revisions`, `players`, `jobs`, `audit_log` arrive with
+  their milestones. The single-node v1 does not need `servers.node_id` yet; adding it later is an
+  additive migration (`ALTER TABLE servers ADD COLUMN node_id` + backfill). Backups and scheduled
+  tasks are now implemented as described above.
 - IDs are UUIDv7 (time-sortable) generated in Rust, stored as TEXT. Timestamps are UTC ISO-8601.
 
 ### 10.2 SQLite settings
@@ -580,7 +733,10 @@ connections, migrations embedded via `sqlx::migrate!`. `_sqlx_migrations` record
 - Both Rust processes bind to loopback; the daemon owns the Docker socket and Minecraft volumes.
   SQLite is stored under `/var/lib/cluster-console`; server data is under `/srv/minecraft`.
 - The supplied Nginx site listens on port 80. Add TLS before exposing it to the public internet;
-  nightly database snapshots and backup sync remain future operations work.
+  nightly **database** snapshots and off-host backup sync remain future operations work (per-server
+  data backups are implemented and stay on the node disk).
+- The MCP server runs on the operator's workstation over stdio and is **not** deployed to the VPS;
+  it reaches the API through Nginx or an SSH tunnel using a JWT.
 - Health: `/healthz` (liveness) and `/readyz` (DB + node reachability) on both binaries.
 - Observability: `tracing` structured logs (JSON via `LOG_FORMAT=json`), request IDs end-to-end,
   Prometheus `/metrics` in v1.1.
@@ -603,6 +759,8 @@ connections, migrations embedded via `sqlx::migrate!`. `_sqlx_migrations` record
 | D11 | Proxies are managed containers (`velocity`/`bungeecord`) grouped by `proxy_networks`; backends behind a proxy do not publish a port | accepted |
 | D12 | First-run admin is seeded only when `users` is empty; password from `ADMIN_PASSWORD`, otherwise random and logged once; a password change is forced at first login | accepted |
 | D13 | Config editing round-trips ordered `server.properties` entries, uses SHA-256 optimistic concurrency, and redacts `rcon.password` from the browser while restoring it on save | accepted |
+| D14 | Backups are ZIP archives with SHA-256 sidecar manifests on the node; recurring tasks are SQLite rows executed by an in-process 20 s worker | accepted |
+| D15 | The markdown context protocol is implemented as an MCP server exposing repository markdown as resources and the REST API as typed tools | accepted |
 
 ## 13. Open questions for review
 

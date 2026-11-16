@@ -863,12 +863,21 @@ pub async fn list_directory(
     let path = if relative.is_empty() {
         root.clone()
     } else {
-        resolve_existing(&root, relative)?.0
+        match resolve_existing(&root, relative) {
+            Ok((path, _)) => path,
+            // Optional add-on folders (`plugins`, `mods`, `resourcepacks`,
+            // `<world>/datapacks`) do not exist until the server or an install
+            // creates them. Listing them is a normal empty listing, not a 404.
+            Err(DaemonError::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        }
     };
 
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .map_err(map_io("inspect directory"))?;
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(map_io("inspect directory")(error)),
+    };
     if !metadata.is_dir() {
         return Err(DaemonError::BadRequest("path is not a directory".into()));
     }

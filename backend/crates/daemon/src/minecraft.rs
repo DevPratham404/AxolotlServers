@@ -11,19 +11,44 @@ use bollard::models::{
 };
 use cluster_shared::CreateServerSpec;
 
-/// Minecraft's in-container game port.
+/// Minecraft's in-container Java game port.
 pub const CONTAINER_PORT: u16 = 25565;
+/// BungeeCord and Waterfall listen on this port inside `itzg/mc-proxy`.
+pub const PROXY_CONTAINER_PORT: u16 = 25577;
+/// Bedrock Edition's in-container game port.
+pub const BEDROCK_CONTAINER_PORT: u16 = 19132;
 
 /// RCON listens here inside the container. It is published on the host loopback
 /// only (never the public interface) because the daemon reaches it over TCP.
 pub const RCON_PORT: u16 = 25575;
 
-fn game_port_key(spec: &CreateServerSpec) -> String {
-    if matches!(spec.server_type, cluster_shared::ServerType::Bedrock) {
-        "19132/udp".to_string()
+/// Container-side game port for the runtime.
+///
+/// BungeeCord/Waterfall default to 25577 in the mc-proxy image, while Velocity
+/// keeps Velocity's own default of 25565 unless its `velocity.toml` is edited.
+/// Publishing 25577 for a Velocity container would leave the host port bound to
+/// a listener that does not exist.
+pub fn game_container_port(server_type: cluster_shared::ServerType) -> u16 {
+    if matches!(
+        server_type,
+        cluster_shared::ServerType::Bungeecord | cluster_shared::ServerType::Waterfall
+    ) {
+        PROXY_CONTAINER_PORT
+    } else if matches!(server_type, cluster_shared::ServerType::Bedrock) {
+        BEDROCK_CONTAINER_PORT
     } else {
-        format!("{CONTAINER_PORT}/tcp")
+        CONTAINER_PORT
     }
+}
+
+fn game_port_key(spec: &CreateServerSpec) -> String {
+    let port = game_container_port(spec.server_type);
+    let protocol = if matches!(spec.server_type, cluster_shared::ServerType::Bedrock) {
+        "udp"
+    } else {
+        "tcp"
+    };
+    format!("{port}/{protocol}")
 }
 
 /// Deterministic identity: the daemon never relies on a stored container id.
@@ -102,6 +127,13 @@ pub fn env_for(spec: &CreateServerSpec, rcon_password: &str) -> Vec<String> {
         env.push(format!("SEED={}", spec.world_seed));
     }
 
+    if matches!(spec.server_type, cluster_shared::ServerType::Arclight) {
+        // itzg defaults to NeoForge, but pinning it makes the downloaded jar and
+        // the mod loader explicit and prevents a future default change from
+        // silently switching the runtime family.
+        env.push("ARCLIGHT_TYPE=NEOFORGE".to_string());
+    }
+
     if spec.is_behind_proxy {
         // The proxy performs authentication; backends must accept its players.
         env.push("ONLINE_MODE=false".to_string());
@@ -144,9 +176,14 @@ pub fn host_config(spec: &CreateServerSpec, network: &str, data_root: &str) -> H
         port_bindings: Some(bindings),
         network_mode: Some(network.to_string()),
         binds: Some(vec![format!(
-            "{}/{}/data:/data",
+            "{}/{}/data:{}",
             data_root.trim_end_matches('/'),
-            spec.id
+            spec.id,
+            if spec.server_type.is_proxy() {
+                "/server"
+            } else {
+                "/data"
+            }
         )]),
         restart_policy: Some(RestartPolicy {
             name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -263,6 +300,60 @@ mod tests {
                 .as_deref(),
             Some("mc-net")
         );
+    }
+
+    #[test]
+    fn publishes_proxy_and_bedrock_container_ports() {
+        let mut proxy = spec(false);
+        proxy.server_type = ServerType::Waterfall;
+        proxy.game_port = 25565;
+        let bindings = host_config(&proxy, "mc-net", "/srv/mc")
+            .port_bindings
+            .expect("proxy bindings");
+        let binding = bindings.get("25577/tcp").expect("proxy listener");
+        assert_eq!(
+            binding.as_ref().expect("binding list")[0]
+                .host_port
+                .as_deref(),
+            Some("25565")
+        );
+        assert!(!bindings.contains_key("25565/tcp"));
+
+        // Velocity keeps its own 25565 default; publishing 25577 would point at
+        // a closed port.
+        let mut velocity = spec(false);
+        velocity.server_type = ServerType::Velocity;
+        velocity.game_port = 25566;
+        let bindings = host_config(&velocity, "mc-net", "/srv/mc")
+            .port_bindings
+            .expect("velocity bindings");
+        let binding = bindings.get("25565/tcp").expect("velocity listener");
+        assert_eq!(
+            binding.as_ref().expect("binding list")[0]
+                .host_port
+                .as_deref(),
+            Some("25566")
+        );
+        assert!(!bindings.contains_key("25577/tcp"));
+
+        let mut bedrock = spec(false);
+        bedrock.server_type = ServerType::Bedrock;
+        let bindings = host_config(&bedrock, "mc-net", "/srv/mc")
+            .port_bindings
+            .expect("bedrock bindings");
+        assert!(bindings.contains_key("19132/udp"));
+        assert!(!bindings.contains_key("25565/tcp"));
+    }
+
+    #[test]
+    fn adds_arclight_loader_and_avoids_invalid_types() {
+        let mut arclight = spec(false);
+        arclight.server_type = ServerType::Arclight;
+        let env = env_for(&arclight, "secret");
+        assert!(env.contains(&"TYPE=ARCLIGHT".to_string()));
+        assert!(env.contains(&"ARCLIGHT_TYPE=NEOFORGE".to_string()));
+
+        assert_eq!(ServerType::CatServer.itzg_type(), "CUSTOM");
     }
 
     #[test]

@@ -10,11 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use cluster_shared::{
-    AddonDownloadRequest, AddonDownloadResult, ApiErrorBody, CreateServerSpec, DirectoryEntry,
-    FileContent, FileCopyRequest, FileRenameRequest, FileWriteRequest, HMAC_BODY_SHA256_HEADER,
-    HMAC_SIGNATURE_HEADER, HMAC_TIMESTAMP_HEADER, ImportServerResult, ModpackInstallRequest,
-    ModpackInstallResult, PlayerAccessLists, PlayerAccessUpdate, PlayerHistoryEntry,
-    RconCommandRequest, RconCommandResponse, ServerResources, sign, sign_digest,
+    AddonDownloadRequest, AddonDownloadResult, ApiErrorBody, BackupCreateRequest, BackupInfo,
+    BackupVerification, CreateServerSpec, DirectoryEntry, FileContent, FileCopyRequest,
+    FileRenameRequest, FileWriteRequest, HMAC_BODY_SHA256_HEADER, HMAC_SIGNATURE_HEADER,
+    HMAC_TIMESTAMP_HEADER, ImportServerResult, ModpackInstallRequest, ModpackInstallResult,
+    PlayerAccessLists, PlayerAccessUpdate, PlayerHistoryEntry, RconCommandRequest,
+    RconCommandResponse, ServerResources, sign, sign_digest,
 };
 use futures_util::stream;
 use reqwest::{Body, Method, StatusCode, header};
@@ -43,7 +44,7 @@ impl DaemonClient {
         shared_secret: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| anyhow::anyhow!("build daemon HTTP client: {error}"))?;
 
@@ -346,6 +347,64 @@ impl DaemonClient {
             .await
     }
 
+    pub async fn list_backups(&self, server_id: &str) -> Result<Vec<BackupInfo>, ApiError> {
+        let path = format!("/daemon/servers/{server_id}/backups");
+        self.send_json(Method::GET, &path, b"").await
+    }
+
+    pub async fn create_backup(
+        &self,
+        server_id: &str,
+        name: Option<String>,
+    ) -> Result<BackupInfo, ApiError> {
+        let body = serde_json::to_vec(&BackupCreateRequest { name })
+            .map_err(|error| ApiError::Internal(format!("serialize backup request: {error}")))?;
+        let path = format!("/daemon/servers/{server_id}/backups");
+        self.send_json(Method::POST, &path, &body).await
+    }
+
+    pub async fn restore_backup(
+        &self,
+        server_id: &str,
+        backup_id: &str,
+    ) -> Result<BackupInfo, ApiError> {
+        let backup_id = percent_encode_segment(backup_id);
+        let path = format!("/daemon/servers/{server_id}/backups/{backup_id}/restore");
+        self.send_json(Method::POST, &path, b"").await
+    }
+
+    pub async fn delete_backup(&self, server_id: &str, backup_id: &str) -> Result<(), ApiError> {
+        let backup_id = percent_encode_segment(backup_id);
+        let path = format!("/daemon/servers/{server_id}/backups/{backup_id}");
+        self.send(Method::DELETE, &path, b"").await
+    }
+
+    /// Verify an archive against its manifest without transferring the bytes.
+    pub async fn verify_backup(
+        &self,
+        server_id: &str,
+        backup_id: &str,
+    ) -> Result<BackupVerification, ApiError> {
+        let backup_id = percent_encode_segment(backup_id);
+        let path = format!("/daemon/servers/{server_id}/backups/{backup_id}/verify");
+        self.send_json(Method::POST, &path, b"").await
+    }
+
+    /// Open a signed streaming download of a backup archive. Large archives are
+    /// proxied chunk-by-chunk, so the control plane never buffers them in RAM.
+    pub async fn download_backup_stream(
+        &self,
+        server_id: &str,
+        backup_id: &str,
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + use<>,
+        ApiError,
+    > {
+        let backup_id = percent_encode_segment(backup_id);
+        let path = format!("/daemon/servers/{server_id}/backups/{backup_id}/download");
+        self.open_stream(&path).await
+    }
+
     /// Download raw bytes of a file from the server's data volume.
     pub async fn read_raw_file(
         &self,
@@ -394,6 +453,7 @@ impl DaemonClient {
             .header(HMAC_TIMESTAMP_HEADER, timestamp.to_string())
             .header(HMAC_SIGNATURE_HEADER, signature)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(Duration::from_secs(120))
             .body(body.to_vec());
 
         let response = request
@@ -414,8 +474,10 @@ impl DaemonClient {
     pub async fn open_stream(
         &self,
         path: &str,
-    ) -> Result<impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>>, ApiError>
-    {
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + use<>,
+        ApiError,
+    > {
         let timestamp = now_unix();
         let signature = sign(&self.secret, Method::GET.as_str(), path, timestamp, b"");
 
@@ -491,10 +553,8 @@ impl DaemonClient {
             .http
             .request(method, format!("{}{}", self.base_url, path))
             .header(HMAC_TIMESTAMP_HEADER, timestamp.to_string())
-            .header(HMAC_SIGNATURE_HEADER, signature);
-        if let Some(timeout) = timeout {
-            request = request.timeout(timeout);
-        }
+            .header(HMAC_SIGNATURE_HEADER, signature)
+            .timeout(timeout.unwrap_or(Duration::from_secs(30)));
 
         if !body.is_empty() {
             request = request

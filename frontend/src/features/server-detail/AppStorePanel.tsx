@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
+import rehypeRaw from 'rehype-raw'
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 
 import { ApiError, serverApi } from '../../lib/api'
@@ -13,6 +15,60 @@ import { Spinner } from '../../components/ui/Spinner'
 const MODRINTH_API = 'https://api.modrinth.com/v2'
 const SEARCH_DEBOUNCE_MS = 350
 const PROJECT_STORAGE_PREFIX = 'cluster.addons.projects.'
+
+/**
+ * Modrinth project bodies commonly mix Markdown with raw HTML (`<center>`,
+ * `<img>`, `<br>`, YouTube `<iframe>`s). `react-markdown` escapes HTML by
+ * default, which surfaced those tags as literal text. Parse a deliberately
+ * small HTML subset and sanitise it before it reaches React.
+ */
+const DESCRIPTION_SCHEMA = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames ?? []), 'center', 'iframe'],
+  protocols: {
+    ...defaultSchema.protocols,
+    // Project bodies must not load mixed-content images or embeds.
+    src: ['https'],
+  },
+  attributes: {
+    ...defaultSchema.attributes,
+    center: [],
+    iframe: [
+      'src',
+      'width',
+      'height',
+      'title',
+      'allow',
+      'allowFullScreen',
+      'frameBorder',
+      'loading',
+      'referrerPolicy',
+      'sandbox',
+      'className',
+    ],
+  },
+}
+
+/** Only embeds from these https hosts are actually mounted. */
+const ALLOWED_EMBED_HOSTS = new Set([
+  'www.youtube-nocookie.com',
+  'youtube-nocookie.com',
+  'www.youtube.com',
+  'youtube.com',
+  'player.vimeo.com',
+])
+
+function safeEmbedUrl(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'https:') return null
+    if (!ALLOWED_EMBED_HOSTS.has(url.hostname.toLowerCase())) return null
+    return url.toString()
+  } catch {
+    return null
+  }
+}
 
 const PROJECT_TYPES: Array<{ value: AddonProjectType; label: string; hint: string }> = [
   { value: 'mod', label: 'Mods', hint: 'fabric / forge' },
@@ -822,6 +878,10 @@ function ProjectDetailsModal({
                 {description ? (
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[
+                      rehypeRaw,
+                      [rehypeSanitize, DESCRIPTION_SCHEMA],
+                    ]}
                     components={{
                       h1: ({ children }) => (
                         <h1 className="mt-5 mb-2 text-lg font-semibold text-text-primary">
@@ -882,8 +942,41 @@ function ProjectDetailsModal({
                           src={src}
                           alt={alt ?? ''}
                           loading="lazy"
-                          className="my-3 max-h-72 max-w-full rounded-lg border border-white/10 object-contain"
+                          className="mx-auto my-3 max-h-72 max-w-full rounded-lg border border-white/10 object-contain"
                         />
+                      ),
+                      center: ({ children }) => (
+                        <div className="text-center">{children}</div>
+                      ),
+                      iframe: ({ src, title, width, height }) => {
+                        const safeSrc = safeEmbedUrl(src)
+                        if (!safeSrc) return null
+                        return (
+                          <span className="my-3 block overflow-hidden rounded-lg border border-white/10 bg-black/40">
+                            <iframe
+                              src={safeSrc}
+                              title={typeof title === 'string' ? title : 'Embedded video'}
+                              width={width}
+                              height={height}
+                              loading="lazy"
+                              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                              allowFullScreen
+                              referrerPolicy="strict-origin-when-cross-origin"
+                              sandbox="allow-scripts allow-same-origin allow-presentation"
+                              className="aspect-video h-auto w-full"
+                            />
+                          </span>
+                        )
+                      },
+                      details: ({ children }) => (
+                        <details className="my-3 rounded-lg border border-white/10 bg-black/20 px-3 py-2">
+                          {children}
+                        </details>
+                      ),
+                      summary: ({ children }) => (
+                        <summary className="cursor-pointer text-xs font-medium text-text-primary">
+                          {children}
+                        </summary>
                       ),
                       hr: () => <hr className="my-4 border-white/10" />,
                       table: ({ children }) => (
@@ -1041,22 +1134,68 @@ function AddonIcon({ title, iconUrl }: { title: string; iconUrl: string | null }
   )
 }
 
+const MODDED_TYPES: readonly ServerType[] = ['fabric', 'forge', 'neoforge', 'quilt']
+const HYBRID_TYPES: readonly ServerType[] = ['mohist', 'arclight', 'catserver', 'magma']
+const PLUGIN_TYPES: readonly ServerType[] = [
+  'paper',
+  'spigot',
+  'purpur',
+  'pufferfish',
+  'folia',
+  'sponge',
+  'velocity',
+  'bungeecord',
+  'waterfall',
+  ...HYBRID_TYPES,
+]
+
+function supportsMods(serverType: ServerType): boolean {
+  return MODDED_TYPES.includes(serverType) || HYBRID_TYPES.includes(serverType)
+}
+
+function supportsPlugins(serverType: ServerType): boolean {
+  return PLUGIN_TYPES.includes(serverType)
+}
+
 function defaultProjectType(serverType: ServerType): AddonProjectType {
-  if (serverType === 'fabric' || serverType === 'forge') return 'mod'
-  if (serverType === 'paper' || serverType === 'velocity' || serverType === 'bungeecord') {
-    return 'plugin'
-  }
+  if (MODDED_TYPES.includes(serverType)) return 'mod'
+  if (supportsPlugins(serverType)) return 'plugin'
   return 'datapack'
 }
 
 function supportsProjectType(projectType: AddonProjectType, serverType: ServerType): boolean {
+  if (projectType === 'mod' || projectType === 'modpack') return supportsMods(serverType)
+  if (projectType === 'plugin') return supportsPlugins(serverType)
+  return true
+}
+
+/** Modrinth loader categories this runtime should search for. */
+function modrinthLoaders(
+  projectType: AddonProjectType,
+  serverType: ServerType,
+): string[] {
   if (projectType === 'mod' || projectType === 'modpack') {
-    return serverType === 'fabric' || serverType === 'forge'
+    if (serverType === 'fabric') return ['fabric']
+    if (serverType === 'forge') return ['forge']
+    if (serverType === 'neoforge') return ['neoforge']
+    if (serverType === 'quilt') return ['quilt']
+    if (HYBRID_TYPES.includes(serverType)) return ['forge', 'neoforge']
+    return []
   }
   if (projectType === 'plugin') {
-    return serverType === 'paper' || serverType === 'velocity' || serverType === 'bungeecord'
+    if (serverType === 'paper') return ['paper', 'spigot', 'bukkit', 'purpur', 'folia']
+    if (serverType === 'spigot') return ['spigot', 'bukkit']
+    if (serverType === 'purpur') return ['purpur', 'paper', 'spigot', 'bukkit']
+    if (serverType === 'pufferfish' || serverType === 'folia') {
+      return [serverType, 'paper', 'spigot', 'bukkit']
+    }
+    if (serverType === 'sponge') return ['sponge']
+    if (serverType === 'velocity') return ['velocity']
+    if (serverType === 'bungeecord' || serverType === 'waterfall') return ['bungeecord']
+    if (HYBRID_TYPES.includes(serverType)) return ['paper', 'spigot', 'bukkit']
+    return []
   }
-  return true
+  return []
 }
 
 function projectTypeLabel(projectType: AddonProjectType): string {
@@ -1068,17 +1207,7 @@ function projectTypeLabel(projectType: AddonProjectType): string {
 }
 
 function loaderCategory(serverType: ServerType, projectType: AddonProjectType): string | null {
-  if (projectType === 'mod' || projectType === 'modpack') {
-    if (serverType === 'fabric' || serverType === 'forge') return serverType
-    return null
-  }
-  if (projectType === 'plugin') {
-    if (serverType === 'paper') return 'paper'
-    if (serverType === 'velocity') return 'velocity'
-    if (serverType === 'bungeecord') return 'bungeecord'
-    return null
-  }
-  return null
+  return modrinthLoaders(projectType, serverType)[0] ?? null
 }
 
 async function searchModrinth(
@@ -1121,16 +1250,8 @@ function allowedLoaders(
   projectType: AddonProjectType,
   serverType: ServerType,
 ): Set<string> {
-  if (projectType === 'modpack' || projectType === 'mod') {
-    return new Set([serverType])
-  }
-  if (projectType === 'plugin') {
-    if (serverType === 'paper') {
-      return new Set(['paper', 'spigot', 'bukkit', 'purpur', 'folia'])
-    }
-    return new Set([serverType])
-  }
-  return new Set(['minecraft'])
+  const loaders = modrinthLoaders(projectType, serverType)
+  return loaders.length > 0 ? new Set(loaders) : new Set(['minecraft'])
 }
 
 function loaderOptionsFor(
@@ -1197,7 +1318,7 @@ function defaultLoaderOption(
   const preferred =
     projectType === 'datapack' || projectType === 'resourcepack'
       ? 'minecraft'
-      : serverType
+      : (modrinthLoaders(projectType, serverType)[0] ?? serverType)
   return options.includes(preferred) ? preferred : (options[0] ?? '')
 }
 
@@ -1269,17 +1390,9 @@ function isLoaderCompatible(
   projectType: AddonProjectType,
   serverType: ServerType,
 ): boolean {
-  const loaders = version.loaders.map((loader) => loader.toLowerCase())
-  if (projectType === 'mod' || projectType === 'modpack') return loaders.includes(serverType)
-  if (projectType === 'plugin') {
-    if (serverType === 'paper') {
-      return loaders.some((loader) =>
-        ['paper', 'spigot', 'bukkit', 'purpur', 'folia'].includes(loader),
-      )
-    }
-    return loaders.includes(serverType)
-  }
-  return true
+  if (projectType === 'datapack' || projectType === 'resourcepack') return true
+  const allowed = allowedLoaders(projectType, serverType)
+  return version.loaders.some((loader) => allowed.has(loader.toLowerCase()))
 }
 
 function hasExtension(filename: string, projectType: AddonProjectType): boolean {

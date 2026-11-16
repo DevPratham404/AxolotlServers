@@ -1,4 +1,4 @@
-use cluster_api::{config::Config, routes, state, telemetry};
+use cluster_api::{config::Config, routes, scheduler, state, telemetry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -7,6 +7,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     let state = state::init(config).await?;
+    scheduler::spawn(state.clone());
     let addr = state.config.addr.clone();
     let app = routes::router(state);
 

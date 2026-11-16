@@ -124,6 +124,8 @@ DAEMON_SHARED_SECRET=<the same shared secret>
 DOCKER_HOST=unix:///var/run/docker.sock
 MC_NETWORK=mc-net
 MC_IMAGE=itzg/minecraft-server:latest
+MC_BEDROCK_IMAGE=itzg/minecraft-bedrock-server:latest
+MC_PROXY_IMAGE=itzg/mc-proxy:latest
 MC_DATA_ROOT=/srv/minecraft
 ```
 

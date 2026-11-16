@@ -446,6 +446,8 @@ proxy-network CRUD and status reconciliation.
 
 - [x] Clicking a card opens a project-details modal
 - [x] Full Modrinth `body` rendered as GitHub-flavoured Markdown (`react-markdown` + `remark-gfm`)
+- [x] Sanitised raw HTML subset (`rehype-raw` + `rehype-sanitize`) for Modrinth `<center>`, `<img>`,
+      `<br>` and YouTube/Vimeo `<iframe>` embeds; untrusted hosts and non-HTTPS sources are dropped
 - [x] Versions filtered by loader and the server's exact `game_version`
 - [x] Latest compatible release preselected; older compatible versions selectable
 - [x] Install sends the selected version file URL to `/addons/install`
@@ -473,6 +475,7 @@ proxy-network CRUD and status reconciliation.
 - [ ] Paper server: confirm Mods is absent, Plugins is selected, Datapacks/Resource Packs remain
 - [ ] Fabric server: confirm Plugins is absent, Mods is selected, Datapacks/Resource Packs remain
 - [ ] Open a project, confirm the Markdown body renders (headings, lists, links, images, tables)
+- [ ] Open WorldEdit and confirm raw HTML renders as centred images/YouTube embeds, not literal tags
 - [ ] For a server pinned to e.g. `1.21.1`, confirm only `1.21.1`-tagged versions are listed
 - [ ] Install an older compatible version and verify that exact file lands on disk
 - [ ] Install from a card, confirm it flips to Delete; delete it and confirm it flips back
@@ -536,8 +539,8 @@ proxy-network CRUD and status reconciliation.
 
 ## M8.8 — Migration engine & production prep
 
-> Delivered; automated checks pass. Manual import review is pending. Stop here until reviewed; do
-> not start M9 or the backup work.
+> Delivered; automated checks pass. Manual import review is pending. M8.9 subsequently delivered
+> backups, scheduling, App Store fixes and the MCP server; M10 (multi-node) remains deferred.
 
 **Migration engine**
 
@@ -560,8 +563,8 @@ proxy-network CRUD and status reconciliation.
 **Verified**
 
 - [x] `cargo check`
-- [x] `cargo test` — 100 passed (35 API, 51 daemon, 14 shared)
-- [x] `npm run build` — 305 modules; Vite reports the existing >500 kB chunk warning
+- [x] `cargo test` — 103 passed (36 API, 53 daemon, 14 shared)
+- [x] `npm run build` — 306 modules; Vite reports the existing >500 kB chunk warning
 
 **Manual review checklist**
 
@@ -571,6 +574,98 @@ proxy-network CRUD and status reconciliation.
 - [ ] Reject traversal/symlink ZIP entries and confirm failed imports leave no partial server row
 - [ ] Confirm both dashboard and Servers entry points open the wizard and validation works
 - [ ] Verify Nginx auth, API routing, WebSocket upgrade and a large upload on the VPS
+
+## M8.9 — Automation, App Store fixes & MCP (markdown context protocol)
+
+> Delivered; automated checks pass. Manual review is pending. This work was requested after M8.8
+> and does not start M10 (multi-node).
+
+**Create & App Store fixes**
+
+- [x] Runtime category buttons select a card in that category; card selection updates the category
+- [x] Validate `world_name` (single safe path component) and `world_seed` on the API
+- [x] Enumerate `world_type`, `difficulty` and `gamemode` on both client and server
+- [x] Import the wizard's optional data ZIP through `POST /api/v1/servers/{id}/import-data`
+- [x] Keep the created server and show an "Open server" fallback when the import fails
+- [x] `ServerType::supports_plugins/supports_mods/supports_modpacks` for all 19 runtimes
+- [x] App Store destination + loader filtering uses the capability helpers (NeoForge, Quilt,
+      Spigot, Purpur, Pufferfish, Folia, Sponge, hybrids, Waterfall)
+
+**Backups**
+
+- [x] Daemon ZIP engine: whole `/data`, deflate, symlink-safe, size/entry caps
+- [x] SHA-256 archive hash + JSON sidecar manifest; list ignores corrupt entries
+- [x] Backup a running server with `save-off` → `save-all flush` → `save-on` best effort
+- [x] Verified restore: hash check → staging extraction → atomic data-directory swap → restart
+- [x] Delete archive + manifest; API catalog table (`0005`)
+- [x] API routes: list/create/delete/restore
+- [x] Automation tab: create, restore with confirmation, delete
+
+**Scheduled tasks**
+
+- [x] `scheduled_tasks` table: interval, enabled, next/last run, last status/error
+- [x] Task types: `backup`, `start`, `stop`, `restart`, `command`
+- [x] 20 s in-process worker with claim-before-run semantics
+- [x] API CRUD + run-now with validation
+- [x] Automation tab: create, pause/enable, run now, delete
+
+**MCP server**
+
+- [x] `mcp/` Node package using `@modelcontextprotocol/sdk` over stdio
+- [x] Every repository markdown file exposed as a `cluster://docs/<path>` resource
+- [x] Tools for docs, servers, backups, schedules and runtime capabilities
+- [x] JWT auth, lazy username/password login, one transparent re-login after 401
+- [x] Destructive annotations; restore creates a safety backup by default
+- [x] `mcp/README.md` with client configs and security notes
+- [x] `npm test` — 6 tests (docs, URI, auth, errors, network)
+
+**Verified**
+
+- [x] `cargo check --workspace --all-targets`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `cargo test --workspace` — 110 passed (40 API, 56 daemon, 14 shared)
+- [x] `npm run build` — 306 modules; `npm run lint` clean
+- [x] `cd mcp && npm test` — 6 passed
+
+**Manual review checklist**
+
+- [ ] Create one server per runtime category and confirm the selected card/category/review agree
+- [ ] Create with a data ZIP; confirm the archive is imported into the stopped container
+- [ ] Install a plugin on Spigot/Purpur/Folia and a mod on NeoForge/Quilt
+- [ ] Back up a running server, mutate a file, restore, confirm revert + restart
+- [ ] Verify a healthy backup (badge shows verified), download it, and confirm the ZIP opens
+- [ ] Set retention to 2, create three backups, confirm only the two newest remain
+- [ ] Scheduled backup produces a catalog row and archive; command task records success/error
+- [ ] MCP client lists resources, reads `docs/state.md` and runs a backup tool
+
+## M8.9.1 — Runtime compatibility & telemetry cleanup
+
+> Delivered; automated checks pass. Manual review is pending.
+
+- [x] `GET /api/v1/runtimes/{server_type}/versions` backed by each runtime's release index
+      (Mojang, Arclight GitHub, CatServer GitHub, Mohist API, Magma API)
+- [x] Create/import wizards load runtime-specific versions and default pinned runtimes to a real build
+- [x] Reject `LATEST`/`SNAPSHOT` for Arclight/CatServer/Mohist/Magma on the API
+- [x] Arclight `ARCLIGHT_TYPE=NEOFORGE` + daemon-pinned `ARCLIGHT_RELEASE`; CatServer via
+      `TYPE=CUSTOM` + `CUSTOM_SERVER`
+- [x] Resolve `MAGMA_VERSION` from the Magma API for a concrete Minecraft version
+- [x] Velocity/BungeeCord/Waterfall use `MC_PROXY_IMAGE` and mount `/server`; BungeeCord/Waterfall
+      publish `25577/tcp`, Velocity `25565/tcp`
+- [x] Remove the daemon client's total timeout from long-lived stats/log streams
+- [x] Treat missing optional folders as empty listings; log daemon `404` at debug
+- [x] Map early RCON `Connection refused` to retryable `409 Conflict`
+- [x] `cargo check`, `clippy -D warnings`, `cargo test` — 110 passed (40 API, 56 daemon, 14 shared)
+- [x] `npm run build` — 306 modules; `npm run lint` clean
+
+**Manual review**
+
+- [ ] Create Arclight with a version from the dropdown; confirm the container reaches RCON/console
+- [ ] Repeat for CatServer, Mohist and Magma; confirm their resolved installer env is used
+- [ ] Start a proxy and connect through it on the published host port
+- [ ] Leave a server detail page open for several minutes; confirm stats/log streams stay connected
+- [ ] Open a fresh server before `server.properties` exists; confirm only an empty-state message and
+      no warning/error log spam
+- [ ] Click a console action during startup; confirm the "still starting" message is retryable
 
 ## M7 — Hardening & ops
 
@@ -583,15 +678,22 @@ proxy-network CRUD and status reconciliation.
 - [ ] Dockerfiles (api, daemon, web), compose stack, Caddy config, systemd unit
 - [ ] Rust tests: port allocator, properties round-trip, NBT round-trip, RBAC (HMAC auth ✅ M2)
 
-## M9 — Backup center
+## M9 — Backup center — **partially delivered in M8.9**
 
-- [ ] Snapshot job: `save-off` → `save-all flush` → tar+zstd → `save-on`
-- [ ] Manifest (SHA-256, version, size, duration) + catalog row + progress events
-- [ ] Retention policy (hourly/daily/weekly)
-- [ ] Restore: safety backup → stop → verify → staged swap → start
-- [ ] Download/upload archives
-- [ ] UI: timeline, verify badge, restore confirmation, live progress
+- [x] Snapshot: `save-off` → `save-all flush` → ZIP `/data` → `save-on` (best effort)
+- [x] SHA-256 manifest + catalog row (`backups`); no progress events yet
+- [x] Retention policy: per-server keep-last-N (`backup_settings`, migration `0006`); pruning
+      runs after each manual or scheduled backup and `0` keeps everything
+- [x] Restore: verify hash → staged extraction/traversal checks → directory swap → restart
+      (safety backup is automatic only in the MCP tool)
+- [x] Download archives: streamed through the signed daemon link, 64 KiB chunks
+- [x] Integrity verify endpoint + per-row verified/corrupt badge in the Automation tab
+- [ ] Upload archives
+- [ ] Retention buckets (hourly/daily/weekly) instead of keep-last-N
+- [ ] UI: full timeline and live create progress (list + restore confirmation exist)
 - [ ] Proxy-aware backups (world vs. proxy config-only snapshots)
+- [ ] Locked backups (exclude from retention)
+- [ ] Off-host sync / notifications
 
 ## M10 — Multi-node & polish
 
@@ -599,7 +701,8 @@ proxy-network CRUD and status reconciliation.
 - [ ] Daemon over TLS + mTLS; node health/timeout handling
 - [ ] Live node metrics (CPU/RAM/disk) charts
 - [ ] Server templates, clone, import existing world
-- [ ] Scheduled backups + restarts with in-game warnings
+- [x] Scheduled backups + restarts (M8.9; no in-game warning yet)
+- [ ] In-game warnings before scheduled restarts/backups
 - [ ] Player session history / playtime analytics
 - [ ] i18n, accessibility pass, reduced-motion mode, mobile layout
 - [ ] Optional PostgreSQL backend behind the same store interface

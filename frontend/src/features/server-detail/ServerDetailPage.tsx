@@ -10,6 +10,7 @@ import { GlassCard } from '../../components/ui/GlassCard'
 import { StatusPill } from '../../components/ui/StatusPill'
 import { LogConsole } from './LogConsole'
 import { AppStorePanel } from './AppStorePanel'
+import { AutomationPanel } from './AutomationPanel'
 import { ConfigurationPanel } from './ConfigurationPanel'
 import { FileManagerPanel } from './FileManagerPanel'
 import { StatsPanel } from './StatsPanel'
@@ -18,7 +19,7 @@ import { PlayersPanel } from './players/PlayersPanel'
 
 type PowerAction = 'start' | 'stop' | 'restart' | null
 
-type DetailTab = 'console' | 'players' | 'configuration' | 'files' | 'addons'
+type DetailTab = 'console' | 'players' | 'configuration' | 'files' | 'addons' | 'automation'
 
 export function ServerDetailPage({
   serverId,
@@ -218,6 +219,9 @@ export function ServerDetailPage({
         <TabButton active={tab === 'addons'} onClick={() => setTab('addons')}>
           App Store
         </TabButton>
+        <TabButton active={tab === 'automation'} onClick={() => setTab('automation')}>
+          Automation
+        </TabButton>
       </div>
 
       {tab === 'players' ? (
@@ -237,6 +241,12 @@ export function ServerDetailPage({
           serverId={server.id}
           serverType={server.server_type}
           gameVersion={server.game_version}
+        />
+      ) : tab === 'automation' ? (
+        <AutomationPanel
+          serverId={server.id}
+          status={server.status}
+          onStatusChanged={() => void load()}
         />
       ) : (
         <div className="grid items-start gap-4 xl:grid-cols-[minmax(340px,0.9fr)_1.6fr]">

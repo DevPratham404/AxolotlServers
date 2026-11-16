@@ -11,7 +11,7 @@ use futures_util::TryStreamExt;
 use crate::{
     config::DaemonConfig,
     error::{DaemonError, is_conflict, is_not_found, is_not_modified},
-    minecraft,
+    minecraft, runtimes,
 };
 
 /// Docker's default stop grace period, matching the image's shutdown needs.
@@ -88,6 +88,8 @@ pub async fn create_server(
     ensure_network(docker, &config.network).await?;
     let image = if matches!(spec.server_type, cluster_shared::ServerType::Bedrock) {
         &config.bedrock_image
+    } else if spec.server_type.is_proxy() {
+        &config.proxy_image
     } else {
         &config.image
     };
@@ -106,13 +108,38 @@ pub async fn create_server(
     let name = minecraft::container_name(&spec.id);
     let options = CreateContainerOptionsBuilder::default().name(&name).build();
     let rcon_password = minecraft::rcon_password(&config.shared_secret, &spec.id);
-    let body = minecraft::create_body(
+    let mut body = minecraft::create_body(
         spec,
         image,
         &config.network,
         &config.data_root,
         &rcon_password,
     );
+    if matches!(spec.server_type, cluster_shared::ServerType::Arclight) {
+        // Pin the release tag that actually contains the selected jar. Newer
+        // Minecraft versions are published as prereleases, which the image's
+        // default `latest` lookup would skip.
+        let tag = runtimes::arclight_release(&spec.game_version).await?;
+        body.env
+            .get_or_insert_with(Vec::new)
+            .push(format!("ARCLIGHT_RELEASE={tag}"));
+    }
+    if matches!(spec.server_type, cluster_shared::ServerType::CatServer) {
+        // itzg has no CatServer TYPE, so resolve the upstream jar and feed it to
+        // the generic custom-jar launcher.
+        let url = runtimes::cat_server_download(&spec.game_version).await?;
+        body.env
+            .get_or_insert_with(Vec::new)
+            .push(format!("CUSTOM_SERVER={url}"));
+    }
+    if matches!(spec.server_type, cluster_shared::ServerType::Magma) {
+        // itzg's Magma installer needs an explicit MAGMA_VERSION; its API only
+        // exposes the supported Minecraft line (`1.21.x`).
+        let version = runtimes::magma_version(&spec.game_version).await?;
+        body.env
+            .get_or_insert_with(Vec::new)
+            .push(format!("MAGMA_VERSION={version}"));
+    }
 
     match docker.create_container(Some(options), body).await {
         Ok(response) => {

@@ -16,6 +16,8 @@ pub struct DaemonConfig {
     pub image: String,
     /// `MC_BEDROCK_IMAGE`, dedicated image for Bedrock Edition servers.
     pub bedrock_image: String,
+    /// `MC_PROXY_IMAGE`, dedicated image for Velocity/BungeeCord/Waterfall.
+    pub proxy_image: String,
     /// `MC_DATA_ROOT` — host directory bind-mounted at `/data`.
     pub data_root: String,
 }
@@ -35,6 +37,8 @@ impl DaemonConfig {
             image: env::var("MC_IMAGE").unwrap_or_else(|_| "itzg/minecraft-server:latest".into()),
             bedrock_image: env::var("MC_BEDROCK_IMAGE")
                 .unwrap_or_else(|_| "itzg/minecraft-bedrock-server:latest".into()),
+            proxy_image: env::var("MC_PROXY_IMAGE")
+                .unwrap_or_else(|_| "itzg/mc-proxy:latest".into()),
             data_root: env::var("MC_DATA_ROOT").unwrap_or_else(|_| "./data/servers".into()),
         }
     }

@@ -64,6 +64,15 @@ impl From<RconError> for DaemonError {
                     .into(),
             ),
             RconError::Timeout => DaemonError::Unavailable("RCON connection timed out".into()),
+            // RCON starts listening several seconds after the container starts.
+            // Treat an early refused connection as a retryable state conflict,
+            // not a Docker/engine failure or an error-level log.
+            RconError::Io(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                DaemonError::Conflict(
+                    "server is still starting; RCON is not ready yet — try again in a few seconds"
+                        .into(),
+                )
+            }
             other => DaemonError::Unavailable(other.to_string()),
         }
     }

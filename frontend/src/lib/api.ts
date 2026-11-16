@@ -3,7 +3,11 @@ import type {
   AuthResponse,
   ApiErrorBody,
   AuthUser,
+  BackupInfo,
+  BackupSettings,
+  BackupVerification,
   CommandResult,
+  CreateScheduleRequest,
   CreateServerRequest,
   DirectoryEntry,
   FileContent,
@@ -13,9 +17,12 @@ import type {
   PlayerAction,
   PlayerHistoryEntry,
   PropertiesResponse,
+  ScheduleView,
   ServerView,
+  ServerType,
   UpdatePropertiesRequest,
   UpdateResourcesRequest,
+  UpdateScheduleRequest,
 } from './types'
 
 const TOKEN_KEY = 'cluster.token'
@@ -187,6 +194,104 @@ export const serverApi = {
     })
   },
 
+  /** Import a ZIP into an existing stopped server (create wizard archive step). */
+  importServerData(id: string, file: File): Promise<ServerView> {
+    const form = new FormData()
+    form.append('file', file)
+    return apiFetch<ServerView>(`/api/v1/servers/${encodeURIComponent(id)}/import-data`, {
+      method: 'POST',
+      body: form,
+    })
+  },
+
+  listBackups(id: string): Promise<BackupInfo[]> {
+    return apiFetch<BackupInfo[]>(`/api/v1/servers/${encodeURIComponent(id)}/backups`)
+  },
+
+  createBackup(id: string, name?: string): Promise<BackupInfo> {
+    return apiFetch<BackupInfo>(`/api/v1/servers/${encodeURIComponent(id)}/backups`, {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    })
+  },
+
+  restoreBackup(id: string, backupId: string): Promise<BackupInfo> {
+    return apiFetch<BackupInfo>(
+      `/api/v1/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}/restore`,
+      { method: 'POST' },
+    )
+  },
+
+  deleteBackup(id: string, backupId: string): Promise<void> {
+    return apiFetch<void>(
+      `/api/v1/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}`,
+      { method: 'DELETE' },
+    )
+  },
+
+  /** Download the raw ZIP archive through the authenticated proxy. */
+  downloadBackup(id: string, backupId: string): Promise<Blob> {
+    return apiFetchBlob(
+      `/api/v1/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}/download`,
+    )
+  },
+
+  verifyBackup(id: string, backupId: string): Promise<BackupVerification> {
+    return apiFetch<BackupVerification>(
+      `/api/v1/servers/${encodeURIComponent(id)}/backups/${encodeURIComponent(backupId)}/verify`,
+      { method: 'POST' },
+    )
+  },
+
+  getBackupSettings(id: string): Promise<BackupSettings> {
+    return apiFetch<BackupSettings>(
+      `/api/v1/servers/${encodeURIComponent(id)}/backups/settings`,
+    )
+  },
+
+  updateBackupSettings(id: string, retentionCount: number): Promise<BackupSettings> {
+    return apiFetch<BackupSettings>(
+      `/api/v1/servers/${encodeURIComponent(id)}/backups/settings`,
+      { method: 'PATCH', body: JSON.stringify({ retention_count: retentionCount }) },
+    )
+  },
+
+  listSchedules(id: string): Promise<ScheduleView[]> {
+    return apiFetch<ScheduleView[]>(`/api/v1/servers/${encodeURIComponent(id)}/schedules`)
+  },
+
+  createSchedule(id: string, request: CreateScheduleRequest): Promise<ScheduleView> {
+    return apiFetch<ScheduleView>(`/api/v1/servers/${encodeURIComponent(id)}/schedules`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    })
+  },
+
+  updateSchedule(
+    id: string,
+    scheduleId: string,
+    request: UpdateScheduleRequest,
+  ): Promise<ScheduleView> {
+    return apiFetch<ScheduleView>(
+      `/api/v1/servers/${encodeURIComponent(id)}/schedules/${encodeURIComponent(scheduleId)}`,
+      { method: 'PATCH', body: JSON.stringify(request) },
+    )
+  },
+
+  deleteSchedule(id: string, scheduleId: string): Promise<void> {
+    return apiFetch<void>(
+      `/api/v1/servers/${encodeURIComponent(id)}/schedules/${encodeURIComponent(scheduleId)}`,
+      { method: 'DELETE' },
+    )
+  },
+
+  runSchedule(id: string, scheduleId: string): Promise<ScheduleView> {
+    return apiFetch<ScheduleView>(
+      `/api/v1/servers/${encodeURIComponent(id)}/schedules/${encodeURIComponent(scheduleId)}/run`,
+      { method: 'POST' },
+    )
+  },
+
   start(id: string): Promise<ServerView> {
     return apiFetch<ServerView>(`/api/v1/servers/${encodeURIComponent(id)}/start`, {
       method: 'POST',
@@ -248,6 +353,14 @@ export const serverApi = {
     return apiFetch<void>(`/api/v1/servers/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     })
+  },
+
+  /** Game versions the selected runtime can actually install. */
+  async runtimeVersions(serverType: ServerType): Promise<string[]> {
+    const response = await apiFetch<{ versions: string[] }>(
+      `/api/v1/runtimes/${encodeURIComponent(serverType)}/versions`,
+    )
+    return response.versions
   },
 
   /** Installed jar/zip files across the server's add-on directories. */

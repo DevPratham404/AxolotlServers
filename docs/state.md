@@ -1,17 +1,66 @@
 # State — Cluster Console
 
-**Last updated:** 2026-11-15
-**Phase:** **M8.8 Migration engine & production prep delivered** — existing servers can be imported
-from a ZIP upload or an absolute host path, and `deployment/` contains the Nginx, systemd and
-operator files for an Oracle VPS. Next: manual review, then wait for approval before M9. Do not
-start M9 or backups.
+**Last updated:** 2026-11-16
+**Phase:** **M8.9.1 runtime fixes + backup center completion** — Arclight/CatServer/Mohist/
+Magma version resolution, proxy image/ports, streaming timeout fixes and early-RCON handling
+are implemented on top of M8.8 + automation. The backup center now also supports authenticated
+archive download, SHA-256 integrity verification and per-server keep-last-N retention.
+`deployment/` still contains the Nginx, systemd and operator files for an Oracle VPS. Next:
+manual end-to-end review, then wait for approval before M10 (multi-node).
 
 ## 1. TL;DR
 
 - Backend is clean: `cargo fmt --check`, `cargo check --workspace --all-targets`,
-  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test` (**100 tests**:
-  35 API + 51 daemon + 14 shared) all pass.
-- Frontend is clean: `npm run build` (tsc + Vite, 305 modules) and `npm run lint` (oxlint) pass.
+  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test` (**111 tests**:
+  40 API + 57 daemon + 14 shared) all pass.
+- Frontend is clean: `npm run build` (tsc + Vite, 348 modules) and `npm run lint` (oxlint) pass.
+- MCP server is clean: `npm test` in `mcp/` (**6 tests**) covers docs discovery, URI building,
+  lazy login/token caching, one re-login after 401, API error mapping and network failures.
+- **Runtime fixes (new):** `GET /api/v1/runtimes/{type}/versions` resolves the versions each
+  runtime actually publishes. Arclight, CatServer, Mohist and Magma reject `LATEST`/`SNAPSHOT`
+  (they lag behind Mojang, which is what made Arclight try to download a nonexistent 26.3 jar).
+  Arclight pins `ARCLIGHT_TYPE=NEOFORGE` and the release tag containing the selected NeoForge jar
+  (newer versions are GitHub prereleases that the image's default `latest` lookup skips); CatServer
+  runs on `TYPE=CUSTOM` with a daemon-resolved
+  `CUSTOM_SERVER` jar; Magma gets a daemon-resolved `MAGMA_VERSION`. Velocity/BungeeCord/Waterfall
+  now use `MC_PROXY_IMAGE` (`itzg/mc-proxy`), mount `/server`; BungeeCord/Waterfall publish
+  `25577/tcp` and Velocity publishes its own `25565/tcp` default.
+- **Telemetry/logging fixes (new):** the daemon client no longer applies its 30 s total request
+  timeout to long-lived stats/log streams (the cause of `error decoding response body` every 30 s).
+  Missing optional folders list as empty; daemon 404s log at debug; early RCON `Connection refused`
+  becomes a retryable `409` instead of an error-level `503`.
+- **Backups (new):** `POST /api/v1/servers/{id}/backups` asks the daemon to ZIP the whole `/data`
+  volume to `<MC_DATA_ROOT>/<id>/backups/<uuid>.zip`, hash it (SHA-256) and write a `.json`
+  manifest. Running servers get `save-off` → `save-all flush` → `save-on` over RCON. Restore
+  verifies the manifest hash, extracts to staging with traversal/symlink/size checks, swaps
+  `data/` and restarts the container if it was running. List/delete are also live, and the API
+  keeps a `backups` catalog row for fast UI listing.
+- **Scheduled tasks (new):** `scheduled_tasks` rows support `backup | start | stop | restart |
+  command` at 1–525 600 minute intervals. A single API worker polls every 20 s, advances
+  `next_run_at` before spawning work (no double-claim), records `last_status`/`last_error`, and
+  catalogs scheduled backups. The Automation tab creates, pauses, runs and deletes tasks.
+- **Backup center completion (new):** `GET …/backups/{id}/download` streams the archive through
+  the signed daemon link in 64 KiB chunks (no control-plane buffering); `POST …/backups/{id}/verify`
+  re-hashes it against the manifest; `GET/PATCH …/backups/settings` stores a per-server
+  keep-last-N policy (0 = keep everything, max 500, migration `0006`). Pruning runs after each
+  successful manual or scheduled backup, is best effort, and never fails the snapshot. The
+  Automation tab adds Verify, Download and Save retention controls plus a per-row integrity badge.
+- **New API surface:** `/api/v1/servers/{id}/backups[/{backup_id}[/restore|/download|/verify]]`,
+  `/api/v1/servers/{id}/backups/settings`, `/api/v1/servers/{id}/schedules[/{schedule_id}[/run]]`,
+  and `POST /api/v1/servers/{id}/import-data` (ZIP into a stopped server).
+- **Create bug fixes:** the runtime category buttons now sync the selected card; the wizard
+  validates world names both client- and server-side; the optional data ZIP is actually imported
+  after creation instead of being silently dropped, with an "Open server" fallback if the import
+  fails. The API also validates `world_name`, `world_seed`, `world_type`, `difficulty` and
+  `gamemode`.
+- **App Store bug fixes:** backend and frontend capability helpers now cover all 19 runtimes.
+  Plugins work on Spigot/Purpur/Pufferfish/Folia/Sponge/proxies/hybrids; mods and modpacks work on
+  NeoForge/Quilt/hybrids; Modrinth loader filters are derived from the same helpers, so the UI
+  cannot offer an incompatible project type.
+- **MCP server (new):** `mcp/` exposes every repository markdown file as a
+  `cluster://docs/<path>` resource and wraps servers, backups, schedules and runtime capability
+  descriptions as MCP tools, with an authenticated REST client and two prompts. See
+  [`mcp/README.md`](../mcp/README.md).
 - **Import engine (M8.8):** `POST /daemon/servers/import` accepts multipart with exactly one source:
   a streamed `file` ZIP (10 GiB body limit) or an absolute `local_path` on the daemon host. ZIPs are
   streamed to `<MC_DATA_ROOT>/.imports`, then extracted in a blocking worker; local paths are
@@ -35,25 +84,26 @@ start M9 or backups.
 - **Modpacks (M8.5):** `POST /daemon/servers/{id}/modpacks/install` streams a `.mrpack`, parses
   `modrinth.index.json`, skips `env.server = "unsupported"` entries, downloads the rest into `mods/`
   with 12-way concurrency, then applies `overrides/` over the server root. The API forwards
-  `project_type: modpack` to this engine and only allows it on Fabric/Forge.
+  `project_type: modpack` to this engine on any mod-capable runtime
+  (Fabric/Forge/NeoForge/Quilt and hybrids).
 - **Version selectors (M8.5):** the details modal replaces the flat version list with **Loader /
   Software** and **Game Version** dropdowns for every project type. Options are derived only from
   versions that have a matching file and support the selected loader; the pair resolves the exact
   Modrinth release. Defaults follow the server's loader and `game_version`.
-- **App Store (M8.1):** the Server Detail page has an **App Store** tab with **Discover** and
-  **Installed** sub-tabs. Discover is strictly bound to the server kind: mods are unavailable on
-  Paper/Velocity/BungeeCord, plugins are unavailable on Fabric/Forge, and datapacks/resource packs
-  are always offered (plus modpacks on Fabric/Forge). Clicking a card opens a details modal with the
-  full Modrinth Markdown body and Loader / Game Version dropdowns; the matching release is resolved
-  from the chosen pair. Installed projects show a red **Delete** in place of **Install**.
+- **App Store (M8.1 + fix):** the Server Detail page has an **App Store** tab with **Discover** and
+  **Installed** sub-tabs. Capability helpers now cover all 19 runtimes: mods/modpacks on
+  Fabric/Forge/NeoForge/Quilt and hybrids, plugins on Bukkit-family runtimes, Sponge and proxies,
+  datapacks/resource packs everywhere. Loader facets and the details modal's compatibility checks
+  are derived from the same helpers. Clicking a card opens a details modal with the full Modrinth
+  Markdown body and Loader / Game Version dropdowns; installed projects show **Delete**.
 - **Daemon downloader:** `POST /daemon/servers/{id}/downloads` streams an HTTPS file into a
   validated `target_directory` with a 50 MiB cap, temporary-file write and atomic rename. Public
   hosts only; loopback/private literals and `.local`/`.internal` names are rejected, and redirects
   are disabled.
-- **Dynamic destinations:** mods → `mods/` (Fabric/Forge only), plugins → `plugins/`
-  (Paper/Velocity/BungeeCord only), datapacks → `<level-name>/datapacks/` (read from
-  `server.properties`, default `world`), resource packs → `plugins/Geyser-Spigot/packs/` when
-  Geyser is installed, otherwise `resourcepacks/`.
+- **Dynamic destinations:** mods → `mods/` on any mod-capable runtime, plugins → `plugins/` on any
+  plugin-capable runtime, datapacks → `<level-name>/datapacks/` (read from `server.properties`,
+  default `world`), resource packs → `plugins/Geyser-Spigot/packs/` when Geyser is installed,
+  otherwise `resourcepacks/`.
 - **Installed list:** `GET /api/v1/servers/{id}/addons` aggregates `.jar`/`.zip` files from the same
   dynamic directories. The Installed sub-tab groups them by folder (`plugins/`, `mods/`,
   `<world>/datapacks/`, …) with per-file Delete buttons, and card state stays reactive after an
@@ -87,12 +137,14 @@ start M9 or backups.
 - The API exposes `GET/PUT /api/v1/servers/{id}/properties` and forwards the directory/file routes.
   It parses the Java properties format into ordered entries, redacts `rcon.password`, restores it
   on save, and uses the SHA-256 hash for optimistic concurrency.
-- The server detail page has **Console**, **Players**, **Configuration**, **File Manager** and
-  **App Store** tabs.
-- Last commit: `99135af feat: M8 advanced app store with strict contextual filtering, markdown details, and reactive install states`.
-  **M8.5 and M8.8 changes are uncommitted.**
-- Roadmap gate: **M8.8 review must pass before M9 (backups).** Backups and multi-node remain
-  deferred. Do not start M9, backups or the companion plugin yet.
+- The server detail page has **Console**, **Players**, **Configuration**, **File Manager**,
+  **App Store** and **Automation** tabs.
+- Latest work in this commit: M8.5 modpacks, M8.8 import/deployment, automation, MCP, M8.9.1
+  runtime fixes, the backup center (verify/download/retention) and safe App Store HTML rendering.
+- Roadmap gate: **manual review must pass before M10 (multi-node).** Backups (create, verify,
+  download, restore, delete, retention), scheduling and the MCP server are implemented;
+  multi-node and the companion plugin remain deferred. Backup upload, locked snapshots and
+  off-host sync stay in M9.
 
 ## 2. Phase status
 
@@ -131,11 +183,19 @@ start M9 or backups.
 | Server import engine (ZIP stream/local path, sandboxed extraction) | ✅ M8.8 |
 | API import + auto port + rollback + import wizard | ✅ M8.8 |
 | Production Nginx / systemd / deployment guide | ✅ M8.8 |
+| Create wizard fixes (category sync, world validation, data ZIP import) | ✅ new |
+| App Store capability fixes for all 19 runtimes | ✅ new |
+| ZIP backups + SHA-256 manifests + verified restore | ✅ new |
+| Backup download + integrity verify + keep-last-N retention | ✅ new |
+| Scheduled backup/power/command tasks + worker | ✅ new |
+| MCP server (markdown resources + API tools) | ✅ new |
+| Runtime version discovery + pinned hybrid versions | ✅ M8.9.1 |
+| Proxy image/ports + CatServer custom jar + Magma build pin | ✅ M8.9.1 |
+| Long-lived stream timeout fix + optional-path/RCON log cleanup | ✅ M8.9.1 |
 | Live vitals/inventory (companion plugin) | ❌ removed from UI in M6.7; remains future plugin work |
 | Proxy-network CRUD, durable jobs | ❌ deferred beyond M6.5 |
-| Manual end-to-end testing gate | ⏭ **M8.8 — review pending** |
+| Manual end-to-end testing gate | ⏭ **review pending** |
 | Hardening & ops | ❌ M7 (deferred until after the store work) |
-| Backups | ❌ deferred |
 | Multi-node | ❌ deferred |
 
 ## 3. Verified working
@@ -147,7 +207,8 @@ start M9 or backups.
 | `cargo fmt --all -- --check` | ✅ clean |
 | `cargo check --workspace --all-targets` | ✅ clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
-| `cargo test --workspace` | ✅ 100 passed (35 API + 51 daemon + 14 shared) |
+| `cargo test --workspace` | ✅ 111 passed (40 API + 57 daemon + 14 shared) |
+| `cd mcp && npm test` | ✅ 6 passed |
 
 New M6 unit coverage: traversal/absolute/NUL path rejection, nested path normalisation, read/write
 round-trip, stale-hash `409`, Unix symlink escape rejection, Java escape/continuation parsing,
@@ -172,19 +233,35 @@ host/extension validation, and router-dispatch tests for the add-on endpoints.
 New M8.5 coverage: `.mrpack` index parsing with `env.server = "unsupported"` filtering, duplicate
 and traversal pack-path rejection, HTTPS enforcement for every pack-file URL, `.mrpack` filename
 validation, override extraction that ignores non-`overrides/` entries, and API destination mapping
-for modpacks (Fabric/Forge only).
+for modpacks on every mod-capable runtime.
 
 New M8.8 coverage: digest-based HMAC signing/verification for streamed bodies (body, method and path
 tampering rejected), ZIP path traversal/absolute-path rejection, backslash normalisation,
 single-wrapper-folder detection, bare-world and root-file wrapper refusals.
 
+New automation coverage: backup round-trip (create → mutate data → verify SHA-256 manifest →
+restore → delete), restore-path traversal rejection (`..`, absolute, NUL), scheduled-task
+validation (name/interval/task type/command), and API route registration for backups
+(including download, verify and settings), schedules and `import-data`. Backup integrity
+verification is tested for both a healthy archive and a tampered one.
+
+New MCP coverage: markdown discovery with ignored directories, deterministic resource ordering,
+encoded `cluster://docs/...` URIs, lazy login + token reuse, one transparent re-login after a 401,
+API error mapping and network-failure messages.
+
+New M8.9.1 coverage: runtime version extraction from Arclight assets and numeric ordering, pinned
+runtime fallbacks (never `LATEST`), API rejection of `LATEST`/`SNAPSHOT` for Arclight/CatServer/
+Mohist/Magma, BungeeCord/Waterfall `25577/tcp` + Velocity `25565/tcp` + Bedrock `19132/udp`
+bindings, `ARCLIGHT_TYPE=NEOFORGE` + release-tag pinning, CatServer `TYPE=CUSTOM`, and Magma
+version-base matching.
+
 ### Frontend
 
 | Check | Result |
 | --- | --- |
-| `npm run build` (`tsc -b && vite build`) | ✅ 305 modules, no TS errors |
+| `npm run build` (`tsc -b && vite build`) | ✅ 348 modules, no TS errors |
 | `npm run lint` (`oxlint`) | ✅ clean |
-| Bundle | ✅ ~565 kB JS / 72 kB CSS (162 kB / 11 kB gzip); Vite still warns about the >500 kB chunk |
+| Bundle | ✅ ~771 kB JS / 73 kB CSS (218 kB / 11 kB gzip); Vite still warns about the >500 kB chunk |
 
 ### End-to-end config editor
 
@@ -217,10 +294,25 @@ server data directory. A real Minecraft start/restart check remains part of M6.5
 | POST | `/api/auth/login` | none | `{username, password}` → token + user |
 | POST | `/api/auth/change-password` | Bearer (pending allowed) | rotates hash, clears flag, returns fresh token |
 | GET | `/api/v1/me` | Bearer | echoes `{id, username, requires_password_change}` |
+| GET | `/api/v1/runtimes/{server_type}/versions` | Bearer | runtime-supported Minecraft versions; pinned runtimes omit `LATEST` |
 | GET | `/api/v1/servers` | Bearer | list, newest first |
 | GET | `/api/v1/servers/{id}` | Bearer | single server (refresh-safe detail view) |
 | POST | `/api/v1/servers` | Bearer | create + provision via daemon → 201 |
 | POST | `/api/v1/servers/import` | Bearer | multipart config + `file` **or** `local_path` → container + imported volume → 201 |
+| POST | `/api/v1/servers/{id}/import-data` | Bearer | ZIP into an existing `stopped`/`error` server → 201 `ServerView` |
+| GET | `/api/v1/servers/{id}/backups` | Bearer | daemon manifests, catalog reconciled → `BackupInfo[]` |
+| POST | `/api/v1/servers/{id}/backups` | Bearer | optional `{name}` → ZIP snapshot → 201 `BackupInfo` |
+| POST | `/api/v1/servers/{id}/backups/{backup_id}/restore` | Bearer | verify + swap data volume → `BackupInfo` |
+| GET | `/api/v1/servers/{id}/backups/{backup_id}/download` | Bearer | stream ZIP archive (`application/zip`, attachment) |
+| POST | `/api/v1/servers/{id}/backups/{backup_id}/verify` | Bearer | re-hash archive → `BackupVerification` |
+| GET | `/api/v1/servers/{id}/backups/settings` | Bearer | `{server_id, retention_count}` (`0` keeps all) |
+| PATCH | `/api/v1/servers/{id}/backups/settings` | Bearer | `{retention_count: 0..=500}` → saved settings |
+| DELETE | `/api/v1/servers/{id}/backups/{backup_id}` | Bearer | delete archive + manifest + catalog row → 204 |
+| GET | `/api/v1/servers/{id}/schedules` | Bearer | list recurring tasks |
+| POST | `/api/v1/servers/{id}/schedules` | Bearer | `{name, task_type, interval_minutes, command?, enabled?, run_now?}` → 201 |
+| PATCH | `/api/v1/servers/{id}/schedules/{schedule_id}` | Bearer | update name/interval/enabled/command |
+| DELETE | `/api/v1/servers/{id}/schedules/{schedule_id}` | Bearer | delete → 204 |
+| POST | `/api/v1/servers/{id}/schedules/{schedule_id}/run` | Bearer | execute now, return refreshed row |
 | POST | `/api/v1/servers/{id}/start` | Bearer | daemon start with current DB resources → `status=running` |
 | POST | `/api/v1/servers/{id}/stop` | Bearer | daemon stop → `status=stopped` |
 | POST | `/api/v1/servers/{id}/restart` | Bearer | daemon stop → apply resources → start → `status=running` |
@@ -264,6 +356,12 @@ Daemon `/daemon/*` endpoints are HMAC-only:
 | PUT | `/daemon/servers/{id}/players/{username}/access` | `{operator?, whitelisted?, banned?}` → updated lists |
 | GET | `/daemon/servers/{id}/stats` | NDJSON `StatsSample` |
 | GET | `/daemon/servers/{id}/logs` | NDJSON `LogLine` |
+| GET | `/daemon/servers/{id}/backups` | `BackupInfo[]` from manifests (works stopped) |
+| POST | `/daemon/servers/{id}/backups` | optional `{name}`; RCON flush + ZIP + SHA-256 manifest → 201 |
+| POST | `/daemon/servers/{id}/backups/{backup_id}/restore` | verify + stop → swap → restart if previously running → `BackupInfo` |
+| GET | `/daemon/servers/{id}/backups/{backup_id}/download` | streamed ZIP body (64 KiB chunks) |
+| POST | `/daemon/servers/{id}/backups/{backup_id}/verify` | re-hash → `BackupVerification` |
+| DELETE | `/daemon/servers/{id}/backups/{backup_id}` | 204; archive + manifest |
 | POST | `/daemon/servers/{id}/files/rename` | `{old_path, new_path}` → 204 |
 | POST | `/daemon/servers/{id}/files/copy` | `{source_path, dest_path}` → 204 |
 | POST | `/daemon/servers/{id}/downloads` | `{url, filename, target_directory}` → `{path, bytes}` (streamed, ≤ 50 MiB) |
@@ -337,11 +435,11 @@ modpacks. The destination is then resolved from the server kind:
 
 | Project type | Destination | Constraint |
 | --- | --- | --- |
-| mod | `mods/` | Fabric or Forge only |
-| plugin | `plugins/` | Paper, Velocity or BungeeCord only |
+| mod | `mods/` | any mod-capable runtime (Fabric/Forge/NeoForge/Quilt/hybrid) |
+| plugin | `plugins/` | any plugin-capable runtime (Bukkit family, Sponge, proxies, hybrids) |
 | datapack | `<level-name>/datapacks/` | `level-name` parsed from `server.properties`, default `world` |
 | resourcepack | `plugins/Geyser-Spigot/packs/` or `resourcepacks/` | Geyser folder detected via the daemon directory listing |
-| modpack | `mods/` plus pack overrides | Fabric or Forge only; forwarded to the daemon modpack engine |
+| modpack | `mods/` plus pack overrides | any mod-capable runtime; forwarded to the daemon modpack engine |
 
 `level-name` is validated as a single simple directory name (no separators, `..` or controls) before
 it is joined into a path. `GET /api/v1/servers/{id}/addons` scans the same applicable directories
@@ -366,8 +464,9 @@ directory are always removed. The API client uses a 900-second per-request timeo
 `/project/{id}/version`. The details modal derives two bounded dropdowns from the project's own
 versions for every project type. **Loader / Software** options are the loaders present on versions
 that also carry a file of the expected extension, intersected with what the server can run
-(Fabric/Forge for mods and modpacks; Paper-compatible `paper|spigot|bukkit|purpur|folia` for plugins
-on Paper; exact proxy names; a synthetic `minecraft` loader for datapacks/resource packs).
+(mod loader names for Fabric/Forge/NeoForge/Quilt and `forge|neoforge` for hybrids;
+`paper|spigot|bukkit|purpur|folia` for Paper-like plugins; `sponge`, `velocity` or `bungeecord` for
+the matching runtimes; a synthetic `minecraft` loader for datapacks/resource packs).
 **Game Version** options are every `game_versions` entry tagged by a file-bearing version for the
 chosen loader, deduplicated and sorted numerically descending. The dropdowns default to the
 server's loader and exact `game_version` when present, otherwise the first option. Changing either
@@ -481,14 +580,16 @@ server and edit `ops.json`, `whitelist.json` and `banned-players.json` while it 
 gamemode and session remain unknown until the companion plugin lands.
 
 The **App Store** tab searches `api.modrinth.com/v2/search` directly from the browser. A project-type
-dropdown is strictly bounded by the server kind: Fabric/Forge offer Mods + Modpacks + Datapacks +
-Resource Packs and default to Mods; Paper/Velocity/BungeeCord offer Plugins + Datapacks + Resource
-Packs and default to Plugins; every other kind defaults to Datapacks. Facets are built dynamically:
-`project_type:<kind>` plus `categories:fabric`/`forge` for mods and modpacks,
-`categories:paper`/`velocity`/`bungeecord` for plugins. Results render as cards (icon, title,
+dropdown is bounded by the runtime capability helpers: mod-capable runtimes offer Mods + Modpacks +
+Datapacks + Resource Packs and default to Mods; plugin-capable runtimes offer Plugins + Datapacks +
+Resource Packs and default to Plugins; every other kind defaults to Datapacks. Facets are built
+dynamically from `modrinthLoaders`: native mod loaders (`fabric`, `forge`, `neoforge`, `quilt`),
+`forge|neoforge` for hybrids, Bukkit-family/proxy/Sponge categories for plugins, and a synthetic
+`minecraft` facet for datapacks/resource packs. Results render as cards (icon, title,
 author, download count, categories). Clicking a card opens a modal that fetches the full project
-body (rendered as GitHub-flavoured Markdown through `react-markdown` + `remark-gfm`), its
-categories and a link back to Modrinth. The modal's footer has **Loader / Software** and **Game
+body (GitHub-flavoured Markdown plus a sanitised raw-HTML subset: centred blocks, images, tables,
+details and trusted YouTube/Vimeo embeds via `react-markdown` + `remark-gfm` + `rehype-raw` +
+`rehype-sanitize`), its categories and a link back to Modrinth. The modal's footer has **Loader / Software** and **Game
 Version** dropdowns derived from the project's versions, defaulted to the server's loader and
 `game_version`, plus the exact resolved release underneath. Modpack installs show a
 **Installing Modpack (This will take a few minutes)…** spinner banner. The card **Install** button
@@ -505,10 +606,86 @@ The detail header adds an amber **Restart** button beside Start/Stop. It calls t
 which marks `stopping`, asks the daemon to stop (35 s grace), apply the latest limits, and start
 again.
 
-The create wizard now includes a **Forge** card and a **Game version** field. The field defaults to
-`LATEST`, accepts free text, and offers a datalist of common releases plus `SNAPSHOT`.
+The create wizard shows all 19 runtimes grouped by category (Official, Plugins, Modded, Hybrid,
+Proxy, Bedrock). Selecting a category highlights its first card, and selecting a card updates the
+category, so the review step always matches the visible choice. The **Game version** field defaults
+to `LATEST`, accepts free text, and offers a datalist of common releases plus `SNAPSHOT`. World
+name/seed/type/difficulty/gamemode are validated before submit. An optional data ZIP is imported
+after the stopped container is created; the "Open server" fallback appears if that import fails.
 
-## 8. Known limitations / security notes
+## 8. Backups, scheduled tasks & MCP (post-M8.8)
+
+### 8.1 Backups
+
+Archives live **outside** `/data`, at `<MC_DATA_ROOT>/<server_id>/backups/<uuid>.zip`, so a
+snapshot never contains previous snapshots. Each archive has a sibling `<uuid>.json` manifest with
+`id`, `name`, `size_bytes`, `sha256`, `created_at_ms` and `server_was_running`.
+
+- **Create:** `POST /daemon/servers/{id}/backups` checks container state, flushes a running server
+  (`save-off`, `save-all flush`), writes the ZIP in a blocking worker (deflate, symlinks skipped,
+  100 GiB per file / 250 GiB total / 2 000 000 entries), hashes it, writes the manifest, then sends
+  `save-on`. RCON failures downgrade to a best-effort filesystem snapshot.
+- **List:** manifests are read from disk and reconciled into the API catalog. Corrupt or
+  half-written manifests are skipped; only entries with a matching `.zip` are returned, newest
+  first.
+- **Restore:** verifies the archive SHA-256 against the manifest, extracts to a staging directory
+  (rejects absolute paths, `..`, NUL/control names and symlinks; caps size and entry counts), moves
+  the live `data/` aside, renames staging into place, then restarts the container if it was
+  running. The restart is attempted even if the restore fails.
+- **Delete:** removes archive + manifest, then the catalog row. There is no automatic retention or
+  off-host sync yet.
+
+The API keeps `backups` rows for fast UI listing; the daemon remains authoritative for archive
+bytes. UI actions are in the **Automation** tab with explicit restore/delete confirmation.
+
+### 8.2 Scheduled tasks
+
+`scheduled_tasks` stores `task_type ∈ {backup, start, stop, restart, command}`,
+`interval_minutes` (1–525 600), `enabled`, `next_run_at`, `last_run_at`, `last_status` and
+`last_error`. The API worker (`api/src/scheduler.rs`) starts with the process, waits 5 s, then
+polls every 20 s:
+
+1. Select up to 20 enabled rows with `next_run_at <= now`.
+2. Advance `next_run_at` by `interval_minutes` **before** spawning execution, so a slow task cannot
+   be claimed twice.
+3. Execute through the same daemon client as HTTP (`create_backup`, start/stop/restart, RCON
+   command), cataloging any scheduled backup.
+4. Record `last_status = success|error` plus a truncated `last_error`.
+
+"Run now" calls the same execution function synchronously and returns the refreshed row. There is
+no durable job queue, retry policy or catch-up window: a crash mid-execution means the task runs on
+its next interval. Commands are capped at 1024 characters with no control characters.
+
+### 8.3 Create and App Store fixes
+
+- **Create wizard:** runtime category buttons now select the first card in that category, so the
+  review step cannot disagree with the highlighted card. `world_name` is validated as a single safe
+  path component (no separators, no `.`/`..`), `world_seed` is length/control checked, and
+  `world_type`/`difficulty`/`gamemode` are enumerated on the API. The optional data ZIP is uploaded
+  through `POST /api/v1/servers/{id}/import-data` **after** the stopped container exists; on import
+  failure the wizard keeps the created server and offers **Open server** rather than discarding it.
+- **App Store:** `ServerType::supports_plugins/supports_mods/supports_modpacks` drive both the API
+  destination and the frontend loader facets. The old Paper/Fabric-only checks are gone, so
+  Spigot/Purpur/Folia/Sponge/proxy/hybrid servers can install plugins and NeoForge/Quilt/hybrid
+  servers can install mods and modpacks. `describe_runtime` in the MCP server returns the same
+  capability matrix for AI clients.
+
+### 8.4 MCP server ("markdown context protocol")
+
+`mcp/` is a standalone Node 20+ stdio server using `@modelcontextprotocol/sdk`:
+
+- **Resources:** every markdown file in the repository (`README.md`, `docs/*`, `deployment/README.md`,
+  `mcp/README.md`) at `cluster://docs/<path>`, MIME `text/markdown`, re-read on every request.
+  Diagnostics go to stderr so stdout stays a clean protocol stream.
+- **Tools:** document listing/reading; server list/get/create/power; backup list/create/restore/
+  delete; schedule list/create/update/run/delete; runtime capability description.
+- **Client:** JWT from `CLUSTER_API_TOKEN`, or lazy login with `CLUSTER_API_USERNAME` /
+  `CLUSTER_API_PASSWORD`, caching the token and re-authenticating exactly once after a 401. API
+  errors are mapped to MCP `isError` results with actionable hints.
+- **Safety:** destructive tools carry MCP annotations, and `restore_backup` creates a safety backup
+  unless explicitly disabled. No port is opened and no state is stored.
+
+## 9. Known limitations / security notes
 
 - The RCON `list` command returns usernames only; ping, gamemode, session time, vitals and inventory
   still require the companion plugin. M6.7 removed the fake vitals/inventory UI rather than imply
@@ -551,8 +728,9 @@ The create wizard now includes a **Forge** card and a **Game version** field. Th
   `localStorage` is authoritative, with normalised slug/title substring matching as a fallback.
   Renaming an installed jar outside the UI, clearing browser storage, or two projects with very
   similar names can therefore produce a missed or false match.
-- The App Store bundle now exceeds Vite's 500 kB chunk warning because of the Markdown renderer.
-  Code-splitting the modal is a polish item, not a correctness issue.
+- The App Store bundle now exceeds Vite's 500 kB chunk warning (~771 kB JS) because of the
+  Markdown/HTML renderer and its sanitizer. Code-splitting the modal is a polish item, not a
+  correctness issue.
 - Modrinth calls are made from the browser, so the user needs network access to `api.modrinth.com`
   even though installs stream through the daemon.
 - Add-on installs use the direct Modrinth CDN file URL and reject redirects. If Modrinth changes its
@@ -565,28 +743,60 @@ The create wizard now includes a **Forge** card and a **Game version** field. Th
 - `game_version` is stored and mapped to `VERSION`, but changing it requires recreating the
   container; it is not editable after provisioning.
 - Older containers need a recreate to pick up the new `VERSION` env var and Forge support.
+- Backups are stored on the same disk as the server data and are not synced off-host. A disk
+  failure loses data and backups together; add retention/off-host sync before relying on this for
+  disaster recovery.
+- A backup of a running server flushes world saves with RCON but the container keeps running while
+  the ZIP is written. Files modified during the snapshot can be internally inconsistent; stop the
+  server for a fully consistent archive.
+- Restore replaces the entire `data/` directory; anything written after the snapshot (including
+  new `server.properties` edits) is lost. A safety backup is only automatic when the MCP tool is
+  used, not when restoring from the web UI.
+- There is no backup retention policy, schedule catch-up or notification delivery. Old archives
+  accumulate until deleted manually, and a scheduled task fires on its next interval after API
+  downtime rather than replaying missed runs.
+- The scheduler is in-process: tasks run only while `cluster-api` is running, and there is no
+  durable job queue or distributed lock. Running two API replicas would double-execute tasks.
+- There is no per-server concurrency guard: a backup that runs longer than its interval can overlap
+  with the next run of the same task.
+- MCP tools have exactly the authority of their bearer token. There is no per-tool scope check;
+  use a dedicated account and treat `CLUSTER_API_TOKEN` as a password.
+- The MCP server authenticates with a long-lived JWT and does not implement token revocation. Rotate
+  `JWT_SECRET` or the account password to invalidate tokens.
 
-## 9. Repository state
+## 10. Repository state
 
-- Last commit: `99135af feat: M8 advanced app store with strict contextual filtering, markdown details, and reactive install states`.
-- M8.5 backend/frontend/docs changes are **uncommitted**.
+- This commit lands M8.5, M8.8, automation, MCP, M8.9.1, the backup center and safe App Store
+  HTML rendering on top of `584d871 Initial clean commit`.
 - New backend files: `daemon/src/files.rs`, `daemon/src/players.rs`, `daemon/src/modpacks.rs`,
-  `api/src/properties.rs`, `api/src/routes/properties.rs`, `api/src/routes/files.rs`,
-  `api/src/routes/addons.rs`, `migrations/0003_forge_and_game_version.sql`.
+  `daemon/src/imports.rs`, `daemon/src/backups.rs`, `api/src/properties.rs`,
+  `api/src/routes/properties.rs`, `api/src/routes/files.rs`, `api/src/routes/addons.rs`,
+  `api/src/routes/automation.rs`, `api/src/routes/runtimes.rs`, `api/src/scheduler.rs`,
+  `daemon/src/runtimes.rs`, `migrations/0003_forge_and_game_version.sql`,
+  `migrations/0004_server_catalog.sql`, `migrations/0005_backups_and_schedules.sql`,
+  `migrations/0006_backup_settings.sql`.
 - New frontend files: `lib/properties.ts`,
   `features/server-detail/ConfigurationPanel.tsx`,
   `features/server-detail/FileManagerPanel.tsx`,
-  `features/server-detail/AppStorePanel.tsx`.
+  `features/server-detail/AppStorePanel.tsx`,
+  `features/server-detail/AutomationPanel.tsx`,
+  `features/servers/ImportServerWizard.tsx`.
+- New MCP files: `mcp/package.json`, `mcp/package-lock.json`, `mcp/README.md`,
+  `mcp/src/{index,api,config,docs}.js`, `mcp/test/{api,docs}.test.js`.
 - `.env.example` has a local `JWT_SECRET` edit and is intentionally excluded from commits.
-- `frontend/dist/` is generated by verification and ignored.
-- New frontend npm dependencies for M8.1: `react-markdown` and `remark-gfm` (Markdown rendering in
-  the project-details modal); both are listed in `package.json`/`package-lock.json`.
+- `frontend/dist/` is generated by verification and ignored; `mcp/node_modules/` is ignored by the
+  root `node_modules/` rule.
+- Frontend npm dependencies for the project-details modal: `react-markdown`, `remark-gfm`,
+  `rehype-raw` and `rehype-sanitize`; all are listed in `package.json`/`package-lock.json`.
 - M8.5 adds the workspace `zip` dependency (`zip v2.6.1` with the `deflate` feature) for `.mrpack`
-  parsing; the lockfile gained `arbitrary`, `derive_arbitrary`, `zip` and `zopfli`.
+  parsing and the new backup engine; the lockfile gained `arbitrary`, `derive_arbitrary`, `zip` and
+  `zopfli`.
 - The daemon now depends on the already-pinned workspace `reqwest` (rustls + stream); no other new
   crates were added beyond that dependency edge.
+- The MCP package adds `@modelcontextprotocol/sdk` and `zod` (Node-only; not part of the Rust or
+  frontend builds).
 
-## 10. How to resume
+## 11. How to resume
 
 ```bash
 # terminal 1 — daemon (needs Docker for lifecycle; file endpoints work without a container)
@@ -602,14 +812,28 @@ ADMIN_PASSWORD='change-me' DATABASE_PATH=./data/control.db JWT_SECRET=dev-jwt \
 # terminal 3 — SPA (proxies /api incl. WS to :8080)
 cd frontend
 npm run dev
+
+# terminal 4 — MCP server (stdio; configure it in your AI client instead of running by hand)
+cd mcp
+CLUSTER_API_URL=http://127.0.0.1:8080 CLUSTER_API_TOKEN=<jwt> npm start
 ```
 
 Create or seed a server, ensure `<MC_DATA_ROOT>/<id>/data/server.properties` exists, then open the
-detail page → **Configuration** or **File Manager**. Run `npm run build` before handing off UI
-changes.
+detail page → **Configuration**, **File Manager**, **App Store** or **Automation**. Run
+`npm run build` before handing off UI changes.
 
-Next: **run the M8.5 review pass** against the patched build, including Modpack filter visibility
-(Fabric/Forge only), a real `.mrpack` install with the long-running banner, the derived Loader /
-Game Version dropdowns for every project type, and the exact-release resolution. Stop after
-verification and wait for user approval. Do not start M9 (backups), multi-node or the companion
-plugin.
+Next: **run the manual review** against the patched build:
+
+1. Create a server from every runtime category, including a NeoForge/Quilt and a hybrid; verify the
+   category/card sync and world validation.
+2. Create a server with an optional data ZIP and confirm the archive lands in `/data`.
+3. Install a plugin on Spigot/Purpur/Folia and a mod on NeoForge/Quilt from the App Store.
+4. Take a backup while the server is running, mutate a file, restore, and verify the file reverted
+   and the container restarted.
+5. Add a scheduled backup and a command task; use **Run now**, then shorten an interval and watch
+   `last_status`/`next_run_at`.
+6. Connect an MCP client, read `cluster://docs/docs/state.md`, and call `list_servers`,
+   `create_backup` and `list_schedules`.
+
+Stop after verification and wait for user approval. Multi-node and the companion plugin remain
+deferred.

@@ -60,6 +60,10 @@ impl IntoResponse for DaemonError {
         let status = self.status();
         if status.is_server_error() {
             tracing::error!(%status, error = %self, "daemon request failed");
+        } else if status == StatusCode::NOT_FOUND {
+            // Missing optional files/directories are expected while a container
+            // provisions or before a runtime creates its data tree.
+            tracing::debug!(%status, error = %self, "daemon request rejected");
         } else {
             tracing::warn!(%status, error = %self, "daemon request rejected");
         }

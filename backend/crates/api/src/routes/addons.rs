@@ -145,22 +145,26 @@ fn install_directory(
     geyser: bool,
 ) -> Result<String, ApiError> {
     match project_type {
-        AddonProjectType::Mod => match server_type {
-            ServerType::Fabric | ServerType::Forge => Ok("mods".into()),
-            other => Err(ApiError::BadRequest(format!(
-                "mods require a Fabric or Forge server, not {}",
-                other.as_str()
-            ))),
-        },
-        AddonProjectType::Plugin => match server_type {
-            ServerType::Paper | ServerType::Velocity | ServerType::Bungeecord => {
-                Ok("plugins".into())
+        AddonProjectType::Mod => {
+            if server_type.supports_mods() {
+                Ok("mods".into())
+            } else {
+                Err(ApiError::BadRequest(format!(
+                    "mods require a mod-capable server (Fabric, Forge, NeoForge, Quilt or a hybrid), not {}",
+                    server_type.as_str()
+                )))
             }
-            other => Err(ApiError::BadRequest(format!(
-                "plugins require a Paper, Velocity or BungeeCord server, not {}",
-                other.as_str()
-            ))),
-        },
+        }
+        AddonProjectType::Plugin => {
+            if server_type.supports_plugins() {
+                Ok("plugins".into())
+            } else {
+                Err(ApiError::BadRequest(format!(
+                    "plugins require a plugin-capable server (Paper, Spigot, Purpur, Folia, a proxy or a hybrid), not {}",
+                    server_type.as_str()
+                )))
+            }
+        }
         AddonProjectType::Datapack => Ok(format!("{level_name}/datapacks")),
         AddonProjectType::Resourcepack => {
             if geyser {
@@ -169,13 +173,16 @@ fn install_directory(
                 Ok("resourcepacks".into())
             }
         }
-        AddonProjectType::Modpack => match server_type {
-            ServerType::Fabric | ServerType::Forge => Ok("mods".into()),
-            other => Err(ApiError::BadRequest(format!(
-                "modpacks require a Fabric or Forge server, not {}",
-                other.as_str()
-            ))),
-        },
+        AddonProjectType::Modpack => {
+            if server_type.supports_modpacks() {
+                Ok("mods".into())
+            } else {
+                Err(ApiError::BadRequest(format!(
+                    "modpacks require a mod-capable server (Fabric, Forge, NeoForge, Quilt or a hybrid), not {}",
+                    server_type.as_str()
+                )))
+            }
+        }
     }
 }
 
@@ -186,13 +193,10 @@ fn addon_directories(
     geyser: bool,
 ) -> Vec<(String, AddonProjectType)> {
     let mut directories = Vec::new();
-    if matches!(server_type, ServerType::Fabric | ServerType::Forge) {
+    if server_type.supports_mods() {
         directories.push(("mods".to_string(), AddonProjectType::Mod));
     }
-    if matches!(
-        server_type,
-        ServerType::Paper | ServerType::Velocity | ServerType::Bungeecord
-    ) {
+    if server_type.supports_plugins() {
         directories.push(("plugins".to_string(), AddonProjectType::Plugin));
     }
     directories.push((

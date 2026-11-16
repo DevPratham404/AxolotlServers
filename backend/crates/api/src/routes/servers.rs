@@ -42,6 +42,10 @@ pub fn router() -> Router<AppState> {
             "/servers/import",
             post(import_server).layer(DefaultBodyLimit::max(MAX_IMPORT_BYTES)),
         )
+        .route(
+            "/servers/{id}/import-data",
+            post(import_existing_data).layer(DefaultBodyLimit::max(MAX_IMPORT_BYTES)),
+        )
         .route("/servers/{id}", get(get_one).delete(remove))
         .route("/servers/{id}/start", post(start))
         .route("/servers/{id}/stop", post(stop))
@@ -453,6 +457,82 @@ async fn import_server(
     Ok((StatusCode::CREATED, Json(fetch(&state.pool, &id).await?)))
 }
 
+/// Import a ZIP into an already-provisioned (and still stopped) server. This is
+/// used by the create wizard's optional world/server archive step.
+async fn import_existing_data(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<ServerView>), ApiError> {
+    let server = fetch(&state.pool, &id).await?;
+    if server.status != "stopped" && server.status != "error" {
+        return Err(ApiError::Conflict(
+            "the server must be stopped before importing data".into(),
+        ));
+    }
+
+    let mut upload = TempUpload::default();
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::BadRequest(format!("invalid import form: {error}")))?
+    {
+        if field.name() != Some("file") {
+            let _ = field.bytes().await;
+            continue;
+        }
+        if upload.path.is_some() {
+            return Err(ApiError::BadRequest("provide exactly one ZIP file".into()));
+        }
+        let path = std::env::temp_dir().join(format!("cluster-data-{}.zip", Uuid::now_v7()));
+        let file = tokio::fs::File::create(&path).await.map_err(|error| {
+            ApiError::Internal(format!("create import temporary file: {error}"))
+        })?;
+        let mut writer = tokio::io::BufWriter::new(file);
+        let mut total = 0usize;
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|error| ApiError::BadRequest(format!("read import archive: {error}")))?
+        {
+            total = total.saturating_add(chunk.len());
+            if total > MAX_IMPORT_BYTES {
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(ApiError::BadRequest("import archive is too large".into()));
+            }
+            writer.write_all(&chunk).await.map_err(|error| {
+                ApiError::Internal(format!("write import temporary file: {error}"))
+            })?;
+        }
+        writer
+            .flush()
+            .await
+            .map_err(|error| ApiError::Internal(format!("flush import temporary file: {error}")))?;
+        writer
+            .into_inner()
+            .sync_all()
+            .await
+            .map_err(|error| ApiError::Internal(format!("sync import temporary file: {error}")))?;
+        if total == 0 {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(ApiError::BadRequest(
+                "uploaded import archive is empty".into(),
+            ));
+        }
+        upload.path = Some(path);
+    }
+
+    let Some(path) = upload.path.clone() else {
+        return Err(ApiError::BadRequest("a ZIP file is required".into()));
+    };
+    state
+        .daemon
+        .import_server(&id, DaemonImportSource::Zip { path })
+        .await?;
+    tracing::info!(server_id = %id, "imported data into existing server");
+    Ok((StatusCode::CREATED, Json(fetch(&state.pool, &id).await?)))
+}
+
 async fn read_text(
     mut field: axum::extract::multipart::Field<'_>,
     max_bytes: usize,
@@ -643,6 +723,15 @@ fn validate(request: &CreateServerRequest) -> Result<(String, String), ApiError>
     let game_version =
         normalize_game_version(&request.game_version).map_err(ApiError::BadRequest)?;
 
+    if request.server_type.requires_explicit_game_version()
+        && matches!(game_version.as_str(), "LATEST" | "SNAPSHOT")
+    {
+        return Err(ApiError::BadRequest(format!(
+            "{} does not publish builds for {}, choose a supported game version",
+            request.server_type, game_version
+        )));
+    }
+
     if request.game_port < MIN_GAME_PORT {
         return Err(ApiError::BadRequest(format!(
             "game_port must be at least {MIN_GAME_PORT}"
@@ -675,7 +764,79 @@ fn validate(request: &CreateServerRequest) -> Result<(String, String), ApiError>
         ));
     }
 
+    validate_world_name(&request.world_name)?;
+    validate_world_seed(&request.world_seed)?;
+    validate_choice(
+        "world_type",
+        &request.world_type,
+        &[
+            "default",
+            "flat",
+            "largeBiomes",
+            "amplified",
+            "normal",
+            "large_biomes",
+        ],
+    )?;
+    validate_choice(
+        "difficulty",
+        &request.difficulty,
+        &["peaceful", "easy", "normal", "hard"],
+    )?;
+    validate_choice(
+        "gamemode",
+        &request.gamemode,
+        &["survival", "creative", "adventure", "spectator"],
+    )?;
+
     Ok((name.to_string(), game_version))
+}
+
+/// The world name becomes both the itzg `LEVEL` env value and a directory name
+/// inside the data volume. Keep it to a single safe path component.
+fn validate_world_name(raw: &str) -> Result<(), ApiError> {
+    let value = raw.trim();
+    if value.is_empty() || value.chars().count() > 128 {
+        return Err(ApiError::BadRequest(
+            "world_name must be between 1 and 128 characters".into(),
+        ));
+    }
+    if value == "." || value == ".." || value.contains(['/', '\\', '\0']) {
+        return Err(ApiError::BadRequest(
+            "world_name must be a single directory name".into(),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "world_name must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_world_seed(raw: &str) -> Result<(), ApiError> {
+    if raw.chars().count() > 128 {
+        return Err(ApiError::BadRequest(
+            "world_seed must be at most 128 characters".into(),
+        ));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "world_seed must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_choice(field: &str, raw: &str, allowed: &[&str]) -> Result<(), ApiError> {
+    if allowed.contains(&raw.trim()) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "{field} must be one of: {}",
+            allowed.join(", ")
+        )))
+    }
 }
 
 async fn ensure_proxy_network_exists(pool: &SqlitePool, network_id: &str) -> Result<(), ApiError> {
@@ -806,5 +967,27 @@ mod tests {
 
         req.game_version = String::new();
         assert!(validate(&req).is_err());
+    }
+
+    #[test]
+    fn hybrids_reject_the_latest_alias() {
+        for server_type in [
+            ServerType::Arclight,
+            ServerType::CatServer,
+            ServerType::Mohist,
+            ServerType::Magma,
+        ] {
+            let mut req = request();
+            req.server_type = server_type;
+            req.game_version = "LATEST".into();
+            assert!(
+                validate(&req).is_err(),
+                "{} must require a pinned version",
+                server_type.as_str()
+            );
+
+            req.game_version = "1.21.1".into();
+            assert!(validate(&req).is_ok());
+        }
     }
 }

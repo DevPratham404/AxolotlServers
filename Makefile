@@ -5,7 +5,7 @@ SHELL := /bin/bash
 WEB := frontend
 BACKEND := backend
 
-.PHONY: help dev web-install web-dev web-build api daemon fmt lint test build check
+.PHONY: help dev web-install web-dev web-build api daemon fmt lint test build check mcp-install mcp-test mcp
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -42,3 +42,12 @@ build: ## Build both Rust binaries (release)
 
 check: ## Type-check the whole workspace
 	cd $(BACKEND) && cargo check --workspace --all-targets
+
+mcp-install: ## Install MCP server dependencies
+	cd mcp && npm install
+
+mcp-test: ## Run MCP server tests
+	cd mcp && npm test
+
+mcp: ## Run the MCP server over stdio (requires CLUSTER_API_TOKEN)
+	cd mcp && npm start

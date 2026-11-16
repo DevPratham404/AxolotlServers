@@ -1,9 +1,11 @@
 pub mod addons;
 pub mod auth;
+pub mod automation;
 pub mod files;
 pub mod health;
 pub mod players;
 pub mod properties;
+pub mod runtimes;
 pub mod servers;
 pub mod v1;
 pub mod ws;
@@ -98,6 +100,20 @@ mod tests {
         let app = router(test_state());
         let cases = [
             (Method::POST, "/api/v1/servers/import"),
+            (Method::POST, "/api/v1/servers/x/import-data"),
+            (Method::GET, "/api/v1/servers/x/backups"),
+            (Method::POST, "/api/v1/servers/x/backups"),
+            (Method::GET, "/api/v1/servers/x/backups/settings"),
+            (Method::PATCH, "/api/v1/servers/x/backups/settings"),
+            (Method::DELETE, "/api/v1/servers/x/backups/y"),
+            (Method::POST, "/api/v1/servers/x/backups/y/restore"),
+            (Method::GET, "/api/v1/servers/x/backups/y/download"),
+            (Method::POST, "/api/v1/servers/x/backups/y/verify"),
+            (Method::GET, "/api/v1/servers/x/schedules"),
+            (Method::POST, "/api/v1/servers/x/schedules"),
+            (Method::PATCH, "/api/v1/servers/x/schedules/y"),
+            (Method::DELETE, "/api/v1/servers/x/schedules/y"),
+            (Method::POST, "/api/v1/servers/x/schedules/y/run"),
             (Method::GET, "/api/v1/servers/x/players"),
             (Method::GET, "/api/v1/servers/x/players/history"),
             (Method::GET, "/api/v1/servers/x/players/access"),
@@ -110,6 +126,7 @@ mod tests {
             (Method::POST, "/api/v1/servers/x/files/copy"),
             (Method::GET, "/api/v1/servers/x/addons"),
             (Method::POST, "/api/v1/servers/x/addons/install"),
+            (Method::GET, "/api/v1/runtimes/arclight/versions"),
             (Method::GET, "/api/v1/servers/x/files/foo.txt?download=true"),
             (Method::POST, "/api/v1/servers/x/directory/foo"),
             (Method::PUT, "/api/v1/servers/x/directory/foo"),

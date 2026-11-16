@@ -11,10 +11,11 @@ use axum::{
 use bollard::query_parameters::{LogsOptionsBuilder, StatsOptionsBuilder};
 use bytes::Bytes;
 use cluster_shared::{
-    AddonDownloadRequest, AddonDownloadResult, CreateServerSpec, DirectoryEntry, FileContent,
-    FileCopyRequest, FileRenameRequest, FileWriteRequest, ImportServerResult,
-    ModpackInstallRequest, ModpackInstallResult, PlayerAccessLists, PlayerAccessUpdate,
-    PlayerHistoryEntry, RconCommandRequest, RconCommandResponse, ServerResources,
+    AddonDownloadRequest, AddonDownloadResult, BackupCreateRequest, BackupInfo, BackupVerification,
+    CreateServerSpec, DirectoryEntry, FileContent, FileCopyRequest, FileRenameRequest,
+    FileWriteRequest, ImportServerResult, ModpackInstallRequest, ModpackInstallResult,
+    PlayerAccessLists, PlayerAccessUpdate, PlayerHistoryEntry, RconCommandRequest,
+    RconCommandResponse, ServerResources,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -24,8 +25,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
-    api::DaemonState, docker, error::DaemonError, files, imports, logs, minecraft, modpacks,
-    players, rcon, stats,
+    api::DaemonState, backups, docker, error::DaemonError, files, imports, logs, minecraft,
+    modpacks, players, rcon, stats,
 };
 
 pub fn router() -> Router<DaemonState> {
@@ -60,6 +61,26 @@ pub fn router() -> Router<DaemonState> {
         .route(
             "/daemon/servers/{id}/modpacks/install",
             post(install_modpack),
+        )
+        .route(
+            "/daemon/servers/{id}/backups",
+            get(list_backups).post(create_backup),
+        )
+        .route(
+            "/daemon/servers/{id}/backups/{backup_id}",
+            delete(delete_backup),
+        )
+        .route(
+            "/daemon/servers/{id}/backups/{backup_id}/restore",
+            post(restore_backup),
+        )
+        .route(
+            "/daemon/servers/{id}/backups/{backup_id}/download",
+            get(download_backup),
+        )
+        .route(
+            "/daemon/servers/{id}/backups/{backup_id}/verify",
+            post(verify_backup),
         )
         .route(
             "/daemon/servers/{id}/files/{*path}",
@@ -546,6 +567,160 @@ async fn install_modpack(
     validate_id(&id)?;
     let result = modpacks::install_modpack(&state.config.data_root, &id, &request.url).await?;
     Ok(Json(result))
+}
+
+/// List backup manifests for a server (works while the container is stopped).
+async fn list_backups(
+    State(state): State<DaemonState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<BackupInfo>>, DaemonError> {
+    validate_id(&id)?;
+    Ok(Json(
+        backups::list_backups(&state.config.data_root, &id).await?,
+    ))
+}
+
+/// Snapshot the whole `/data` volume. A running server is flushed with RCON
+/// first (`save-off` → `save-all flush`) and re-enabled afterwards. RCON
+/// failures downgrade to a best-effort filesystem snapshot.
+async fn create_backup(
+    State(state): State<DaemonState>,
+    Path(id): Path<String>,
+    payload: Option<Json<BackupCreateRequest>>,
+) -> Result<(StatusCode, Json<BackupInfo>), DaemonError> {
+    validate_id(&id)?;
+    let running = docker::is_running(&state.docker, &id).await?;
+
+    if running {
+        flush_running_server(&state, &id, "save-off", "save-all flush").await;
+    }
+
+    let name = payload.and_then(|Json(request)| request.name);
+    let result = backups::create_backup(&state.config.data_root, &id, name, running).await;
+
+    if running {
+        flush_running_server(&state, &id, "save-on", "").await;
+    }
+    let info = result?;
+    Ok((StatusCode::CREATED, Json(info)))
+}
+
+/// Best-effort RCON helper used by backup snapshots. The second command is
+/// skipped when empty.
+async fn flush_running_server(state: &DaemonState, id: &str, first: &str, second: &str) {
+    let credentials = match rcon::credentials(&state.docker, &state.config, id).await {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            tracing::warn!(server_id = %id, %error, "RCON unavailable during backup");
+            return;
+        }
+    };
+    for command in [first, second] {
+        if command.is_empty() {
+            continue;
+        }
+        if let Err(error) = rcon::execute(
+            &credentials.host,
+            credentials.port,
+            &credentials.password,
+            command,
+        )
+        .await
+        {
+            tracing::warn!(server_id = %id, command, %error, "backup RCON command failed");
+        }
+    }
+}
+
+/// Restore a verified backup. The container is stopped first and restarted if
+/// it was running before the restore.
+async fn restore_backup(
+    State(state): State<DaemonState>,
+    Path((id, backup_id)): Path<(String, String)>,
+) -> Result<Json<BackupInfo>, DaemonError> {
+    validate_id(&id)?;
+    let running = docker::is_running(&state.docker, &id).await?;
+    if running {
+        docker::stop_server(&state.docker, &id).await?;
+    }
+    let restored = backups::restore_backup(&state.config.data_root, &id, &backup_id).await;
+    if running {
+        // Bring the server back even if the restore failed, so one bad archive
+        // does not silently leave the operator with a stopped server.
+        if let Err(error) = docker::start_server(&state.docker, &id).await {
+            tracing::error!(server_id = %id, %error, "failed to restart server after restore");
+        }
+    }
+    Ok(Json(restored?))
+}
+
+/// Stream a stored archive to the control plane without buffering it in RAM.
+async fn download_backup(
+    State(state): State<DaemonState>,
+    Path((id, backup_id)): Path<(String, String)>,
+) -> Result<Response, DaemonError> {
+    validate_id(&id)?;
+    let path = backups::archive_path(&state.config.data_root, &id, &backup_id)?;
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = tx.blocking_send(Err(error));
+                return;
+            }
+        };
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"backup-{backup_id}.zip\""),
+        )
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .map_err(|error| DaemonError::Internal(format!("build backup download response: {error}")))
+}
+
+/// Re-hash the archive and report whether it still matches its manifest.
+async fn verify_backup(
+    State(state): State<DaemonState>,
+    Path((id, backup_id)): Path<(String, String)>,
+) -> Result<Json<BackupVerification>, DaemonError> {
+    validate_id(&id)?;
+    Ok(Json(
+        backups::verify_backup(&state.config.data_root, &id, &backup_id).await?,
+    ))
+}
+
+async fn delete_backup(
+    State(state): State<DaemonState>,
+    Path((id, backup_id)): Path<(String, String)>,
+) -> Result<StatusCode, DaemonError> {
+    validate_id(&id)?;
+    backups::delete_backup(&state.config.data_root, &id, &backup_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Run a raw Minecraft command over RCON (control-plane initiated).

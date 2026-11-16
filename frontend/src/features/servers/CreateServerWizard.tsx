@@ -15,6 +15,12 @@ const MAX_RAM_GB = 16
 const MIN_CPU = 0.5
 const MAX_CPU = 4
 const CATEGORIES = ['Official', 'Plugins', 'Modded', 'Hybrid', 'Proxy', 'Bedrock'] as const
+const PINNED_VERSION_FALLBACKS: Partial<Record<ServerType, string[]>> = {
+  arclight: ['26.1.2'],
+  catserver: ['1.18.2', '1.16.5', '1.12.2'],
+  mohist: ['1.21.4', '1.21.1', '1.20.1', '1.19.4', '1.18.2', '1.16.5', '1.12.2'],
+  magma: ['1.21.1'],
+}
 
 interface CreateServerWizardProps {
   suggestedPort: number
@@ -42,6 +48,7 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
   const [port, setPort] = useState(String(suggestedPort))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [created, setCreated] = useState<ServerView | null>(null)
 
   const meta = useMemo(() => serverTypeMeta(serverType), [serverType])
   const parsedPort = Number.parseInt(port, 10)
@@ -50,6 +57,12 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
   const nameValid = trimmedName.length >= 1 && trimmedName.length <= 64
   const versionValid = /^[A-Za-z0-9._+-]{1,32}$/.test(trimmedVersion)
   const portValid = Number.isInteger(parsedPort) && parsedPort >= 1024 && parsedPort <= 65535
+  const worldNameValid =
+    worldName.trim().length >= 1 &&
+    worldName.trim().length <= 128 &&
+    !/[\\/\0]/.test(worldName.trim()) &&
+    worldName.trim() !== '.' &&
+    worldName.trim() !== '..'
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -61,30 +74,64 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
 
   useEffect(() => {
     let cancelled = false
-    // Mojang's official version manifest is the source of the release IDs used by Java runtimes.
-    void fetch('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json')
-      .then((response) => response.ok ? response.json() as Promise<{ versions: { id: string; type: string }[] }> : Promise.reject())
-      .then((manifest) => {
-        if (!cancelled) setVersions(['LATEST', ...manifest.versions.filter((item) => item.type === 'release').map((item) => item.id).slice(0, 30)])
+    // oxlint-disable-next-line react/set-state-in-effect
+    setVersionsLoading(true)
+    // Runtime-specific discovery: hybrids lag behind Mojang, so LATEST would
+    // make their installers look for a jar that does not exist.
+    void serverApi
+      .runtimeVersions(serverType)
+      .then((list) => {
+        if (cancelled) return
+        const available = list.length > 0 ? list : ['LATEST']
+        setVersions(available)
+        setGameVersion((current) =>
+          available.includes(current) ? current : available[0],
+        )
       })
-      .catch(() => { if (!cancelled) setVersions(['LATEST']) })
-      .finally(() => { if (!cancelled) setVersionsLoading(false) })
-    return () => { cancelled = true }
-  }, [])
+      .catch(() => {
+        if (cancelled) return
+        const available = PINNED_VERSION_FALLBACKS[serverType] ?? ['LATEST']
+        setVersions(available)
+        setGameVersion((current) =>
+          available.includes(current) ? current : available[0],
+        )
+      })
+      .finally(() => {
+        if (!cancelled) setVersionsLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [serverType])
+
+  function chooseCategory(next: (typeof CATEGORIES)[number]) {
+    setCategory(next)
+    // Keep the selected runtime inside the visible category so the review step
+    // never claims a different software family than the highlighted card.
+    if (serverTypeMeta(serverType).category !== next) {
+      const first = SERVER_TYPES.find((option) => option.category === next)
+      if (first) setServerType(first.value)
+    }
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (created) {
+      onCreated(created)
+      return
+    }
     if (step < STEP_LABELS.length - 1) {
       if (step === 0 && !versionValid) return
       setStep((current) => current + 1)
       return
     }
-    if (!nameValid || !portValid || !versionValid || busy) return
+    if (!nameValid || !portValid || !versionValid || !worldNameValid || busy) return
 
     setBusy(true)
     setError(null)
+    let server: ServerView
     try {
-      const created = await serverApi.create({
+      server = await serverApi.create({
         name: trimmedName,
         server_type: serverType,
         game_version: trimmedVersion,
@@ -94,11 +141,29 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
         world_name: worldName.trim() || 'world', world_seed: worldSeed.trim(), world_type: worldType, difficulty, gamemode,
         is_behind_proxy: false,
       })
-      onCreated(created)
+      setCreated(server)
     } catch (caught) {
       setError(caught instanceof ApiError ? caught.message : 'Could not create the server.')
       setBusy(false)
+      return
     }
+
+    // The container is created first, then the optional archive is imported
+    // into its still-empty /data volume.
+    if (worldArchive) {
+      try {
+        await serverApi.importServerData(server.id, worldArchive)
+      } catch (caught) {
+        setError(
+          `The server was created, but the archive could not be imported: ${
+            caught instanceof ApiError ? caught.message : 'unknown error'
+          }. Close this wizard and use Import Server to retry.`,
+        )
+        setBusy(false)
+        return
+      }
+    }
+    onCreated(server)
   }
 
   return (
@@ -170,7 +235,7 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
                 Pick the runtime baked into the container. Swapping later requires a recreate.
               </p>
               <div className="mb-5 flex flex-wrap gap-2">
-                {CATEGORIES.map((item) => <button key={item} type="button" onClick={() => setCategory(item)} className={cn('rounded-full border px-3 py-1.5 text-xs transition', category === item ? 'border-neon-emerald/40 bg-neon-emerald/10 text-neon-emerald' : 'border-white/10 text-text-muted hover:bg-white/5')}>{item}</button>)}
+                {CATEGORIES.map((item) => <button key={item} type="button" onClick={() => chooseCategory(item)} className={cn('rounded-full border px-3 py-1.5 text-xs transition', category === item ? 'border-neon-emerald/40 bg-neon-emerald/10 text-neon-emerald' : 'border-white/10 text-text-muted hover:bg-white/5')}>{item}</button>)}
               </div>
               <section className="mb-5">
                 <p className="mb-2 font-mono text-[10px] tracking-[0.18em] text-text-dim uppercase">{category} software</p>
@@ -226,7 +291,7 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
                   </select>
                 </label>
                 <p className="mt-2 text-[11px] leading-relaxed text-text-muted">
-                  {versionsLoading ? 'Loading authenticated Mojang release versions…' : 'Release versions come live from Mojang’s official manifest.'} Geyser compatibility depends on its installed version and is checked after provisioning.
+                  {versionsLoading ? 'Loading versions supported by this runtime…' : 'Versions come from the runtime’s own release index; hybrids only offer builds that actually exist.'} Geyser compatibility depends on its installed version and is checked after provisioning.
                 </p>
               </div>
             </div>
@@ -235,9 +300,9 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
           {step === 1 ? (
             <div className="animate-rise space-y-4">
               <p className="text-xs text-text-muted">These values generate the world on its first server start.</p>
-              <TextField label="World name" value={worldName} onChange={(event) => setWorldName(event.target.value)} placeholder="world" hint="Letters, numbers, underscores and dashes are recommended." />
+              <TextField label="World name" value={worldName} onChange={(event) => setWorldName(event.target.value)} placeholder="world" hint="A single folder name; letters, numbers, underscores and dashes are recommended." error={worldName.length > 0 && !worldNameValid ? 'Use a simple name (no slashes).' : undefined} />
               <TextField label="Seed (optional)" value={worldSeed} onChange={(event) => setWorldSeed(event.target.value)} placeholder="Leave blank for a random world" />
-              <div className="rounded-xl border border-dashed border-white/15 bg-black/20 p-4"><p className="text-sm font-medium">Existing world archive</p><p className="mt-1 text-xs text-text-muted">Select a ZIP now; upload is staged after the server is created.</p><input ref={worldUpload} type="file" accept=".zip,application/zip" className="sr-only" onChange={(event) => setWorldArchive(event.target.files?.[0] ?? null)} /><Button type="button" size="sm" variant="secondary" className="mt-3" onClick={() => worldUpload.current?.click()}>{worldArchive ? worldArchive.name : 'Choose world ZIP'}</Button></div>
+              <div className="rounded-xl border border-dashed border-white/15 bg-black/20 p-4"><p className="text-sm font-medium">Existing data archive (optional)</p><p className="mt-1 text-xs text-text-muted">Select a ZIP containing server data or a world folder. It is imported into the new stopped server; leave blank for a freshly generated world.</p><input ref={worldUpload} type="file" accept=".zip,application/zip" className="sr-only" onChange={(event) => setWorldArchive(event.target.files?.[0] ?? null)} /><Button type="button" size="sm" variant="secondary" className="mt-3" onClick={() => worldUpload.current?.click()}>{worldArchive ? worldArchive.name : 'Choose data ZIP'}</Button></div>
               <div className="grid gap-4 sm:grid-cols-3">
                 <Select label="World type" value={worldType} onChange={setWorldType} options={['default', 'flat', 'largeBiomes', 'amplified']} />
                 <Select label="Difficulty" value={difficulty} onChange={setDifficulty} options={['peaceful', 'easy', 'normal', 'hard']} />
@@ -384,10 +449,11 @@ export function CreateServerWizard({ suggestedPort, onClose, onCreated }: Create
               loading={busy}
               disabled={
                 (step === 0 && !versionValid) ||
-                (step === 3 && (!nameValid || !portValid || !versionValid))
+                (step === 3 &&
+                  (!nameValid || !portValid || !versionValid || !worldNameValid))
               }
             >
-              {step === 3 ? 'Create server' : 'Continue'}
+              {created ? 'Open server' : step === 3 ? 'Create server' : 'Continue'}
             </Button>
           </footer>
         </form>

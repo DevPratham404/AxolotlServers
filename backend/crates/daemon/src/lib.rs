@@ -1,6 +1,7 @@
 //! Node daemon library: Docker lifecycle, server files, RCON, backups.
 
 pub mod api;
+pub mod backups;
 pub mod config;
 pub mod docker;
 pub mod error;
@@ -11,5 +12,6 @@ pub mod minecraft;
 pub mod modpacks;
 pub mod players;
 pub mod rcon;
+pub mod runtimes;
 pub mod stats;
 pub mod telemetry;

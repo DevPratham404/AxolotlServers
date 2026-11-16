@@ -11,10 +11,11 @@ pub use hmac_auth::{
 pub use telemetry::{LogLine, LogStream, StatsSample, TelemetryMessage};
 pub use types::{
     AddonDownloadRequest, AddonDownloadResult, AddonInstallRequest, AddonProjectType,
-    CreateServerSpec, DirectoryEntry, FileContent, FileCopyRequest, FileRenameRequest,
-    FileWriteRequest, ImportServerResult, InstalledAddon, ModpackInstallRequest,
-    ModpackInstallResult, PlayerAccessLists, PlayerAccessUpdate, PlayerHistoryEntry,
-    RconCommandRequest, RconCommandResponse, ServerResources, ServerType, normalize_game_version,
+    BackupCreateRequest, BackupInfo, BackupVerification, CreateServerSpec, DirectoryEntry,
+    FileContent, FileCopyRequest, FileRenameRequest, FileWriteRequest, ImportServerResult,
+    InstalledAddon, ModpackInstallRequest, ModpackInstallResult, PlayerAccessLists,
+    PlayerAccessUpdate, PlayerHistoryEntry, RconCommandRequest, RconCommandResponse,
+    ServerResources, ServerType, normalize_game_version,
 };
 
 use serde::{Deserialize, Serialize};

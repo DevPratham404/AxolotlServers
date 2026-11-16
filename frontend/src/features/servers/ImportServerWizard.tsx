@@ -25,6 +25,12 @@ const VERSION_SUGGESTIONS = [
   '1.20.1',
   '1.19.4',
 ] as const
+const PINNED_VERSION_FALLBACKS: Partial<Record<ServerType, string[]>> = {
+  arclight: ['26.1.2'],
+  catserver: ['1.18.2', '1.16.5', '1.12.2'],
+  mohist: ['1.21.4', '1.21.1', '1.20.1', '1.19.4', '1.18.2', '1.16.5', '1.12.2'],
+  magma: ['1.21.1'],
+}
 
 type SourceMode = 'zip' | 'path'
 
@@ -40,6 +46,9 @@ export function ImportServerWizard({ onClose, onImported }: ImportServerWizardPr
   const [localPath, setLocalPath] = useState('')
   const [serverType, setServerType] = useState<ServerType>('paper')
   const [gameVersion, setGameVersion] = useState('LATEST')
+  const [versionSuggestions, setVersionSuggestions] = useState<string[]>([
+    ...VERSION_SUGGESTIONS,
+  ])
   const [ramGb, setRamGb] = useState(4)
   const [cpu, setCpu] = useState(2)
   const [name, setName] = useState('')
@@ -62,6 +71,31 @@ export function ImportServerWizard({ onClose, onImported }: ImportServerWizardPr
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [busy, onClose])
+
+  useEffect(() => {
+    let cancelled = false
+    void serverApi
+      .runtimeVersions(serverType)
+      .then((versions) => {
+        if (cancelled) return
+        const available = versions.length > 0 ? versions : ['LATEST']
+        setVersionSuggestions(available)
+        setGameVersion((current) =>
+          available.includes(current) ? current : available[0],
+        )
+      })
+      .catch(() => {
+        if (cancelled) return
+        const available = PINNED_VERSION_FALLBACKS[serverType] ?? [...VERSION_SUGGESTIONS]
+        setVersionSuggestions(available)
+        setGameVersion((current) =>
+          available.includes(current) ? current : available[0],
+        )
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [serverType])
 
   function selectFile(next: File | null) {
     setFile(next)
@@ -333,7 +367,7 @@ export function ImportServerWizard({ onClose, onImported }: ImportServerWizardPr
                 }
               />
               <datalist id="import-game-version-suggestions">
-                {VERSION_SUGGESTIONS.map((version) => (
+                {versionSuggestions.map((version) => (
                   <option key={version} value={version} />
                 ))}
               </datalist>

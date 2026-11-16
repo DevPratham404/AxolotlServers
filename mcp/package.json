@@ -1,0 +1,22 @@
+{
+  "name": "axolotlservers-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP server exposing Cluster Console documentation and server-management tools",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "axolotlservers-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.1.0"
+  }
+}
